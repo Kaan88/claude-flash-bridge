@@ -1,9 +1,10 @@
 # One-step setup and update of the deepseek-flash bridge on Windows:
 #   irm https://raw.githubusercontent.com/Kaan88/claude-flash-bridge/main/setup.ps1 | iex
-# Installs what is missing (Node.js, Git, Claude Code, OpenCode), clones or updates this repo in
-# ~/.claude/mcp-servers/opencode-agent, signs OpenCode in to DeepSeek if it has no key yet (the key is
-# typed into OpenCode's own prompt and never passes through this script), then runs install.mjs.
-# Safe to run again: everything already present is left alone, and the bridge is updated.
+# Installs only what is missing: Node.js, Git, Claude Code, OpenCode and this bridge. A bridge already installed
+# is used where it is (the copy Claude is registered with, else ~/.claude/mcp-servers/opencode-agent; a git clone
+# is updated). Signs OpenCode in to DeepSeek if it has no key yet (the key is typed into OpenCode's own prompt and
+# never passes through this script), then runs install.mjs.
+# Safe to run again: everything already present is left alone.
 # $env:FLASH_BRIDGE_UPGRADE = "1" also upgrades OpenCode to its latest release.
 
 # Continue, not Stop: Windows PowerShell 5.1 turns a native tool's stderr into a terminating error under Stop.
@@ -61,55 +62,43 @@ if (-not (Have opencode)) {
 if (-not (Have opencode)) { throw "OpenCode still not found after installing; open a new terminal and run this again." }
 Say "OpenCode $((opencode --version) -join ' ')"
 
-# 5. The bridge itself. An existing copy is adopted, whatever made it: a clone is fast-forwarded; a copy
-# made by hand, a zip, or a clone with local edits is backed up next to it first, then brought to the
-# latest version in place (no rename: a running session can hold the folder open on Windows).
-$script:Backup = $null
-function Backup-Bridge {
-    if ($script:Backup) { return }
-    $script:Backup = "$Dir.bak-$(Get-Date -Format yyyyMMdd-HHmmss)"
-    Copy-Item -Recurse -Force $Dir $script:Backup
-    Say "Backed up the existing copy to $script:Backup"
+# 5. The bridge itself: an installed copy is used as it is; only a missing one is installed.
+# A copy registered in Claude Code or Claude Desktop is found wherever it lives, not only in $Dir.
+$findRegistered = @'
+const fs = require("fs"), os = require("os"), p = require("path");
+const desktop = process.platform === "win32" ? p.join(process.env.APPDATA || "", "Claude", "claude_desktop_config.json")
+  : process.platform === "darwin" ? p.join(os.homedir(), "Library", "Application Support", "Claude", "claude_desktop_config.json")
+  : p.join(os.homedir(), ".config", "Claude", "claude_desktop_config.json");
+for (const f of [p.join(os.homedir(), ".claude.json"), desktop]) {
+  try {
+    const s = (JSON.parse(fs.readFileSync(f, "utf8")).mcpServers || {})["deepseek-flash"];
+    const server = ((s && s.args) || []).find((a) => /server\.mjs$/.test(a));
+    if (server && fs.existsSync(server)) { console.log(p.dirname(server)); break; }
+  } catch {}
 }
-function Git-Ok { & git -C $Dir @args 2>$null | Out-Null; $LASTEXITCODE -eq 0 }
+'@
+$registered = ($findRegistered | node - 2>$null | Select-Object -First 1)
+if ($registered) { $Dir = $registered.Trim() }
 
-if ((Have git) -and -not (Test-Path $Dir)) {
-    Say "Cloning the bridge into $Dir"
-    New-Item -ItemType Directory -Force (Split-Path $Dir) | Out-Null
-    git clone $Repo $Dir
-    if ($LASTEXITCODE -ne 0) { throw "git clone failed." }
-} elseif (Have git) {
-    Say "Updating the bridge in $Dir"
-    if (-not (Test-Path (Join-Path $Dir ".git"))) {
-        Say "The existing copy is not a git clone; converting it"
-        Backup-Bridge
-        git -C $Dir init -q
-    }
-    if (-not (Git-Ok remote get-url origin)) { git -C $Dir remote add origin $Repo }
-    git -C $Dir fetch -q origin main
-    if ($LASTEXITCODE -ne 0) { throw "git fetch from $Repo failed." }
-    $hasHead = Git-Ok rev-parse --verify -q HEAD
-    $dirty = $hasHead -and [bool](git -C $Dir status --porcelain --untracked-files=no)
-    if ($hasHead -and -not $dirty -and (Git-Ok merge-base --is-ancestor HEAD origin/main)) {
-        git -C $Dir merge -q --ff-only origin/main
-    } elseif ($hasHead -and -not $dirty -and (Git-Ok merge-base --is-ancestor origin/main HEAD)) {
-        Warn "The local copy has commits GitHub does not have; kept as it is."
+if (Test-Path (Join-Path $Dir "server.mjs")) {
+    if ((Test-Path (Join-Path $Dir ".git")) -and (Have git)) {
+        Say "Bridge found in $Dir; updating it"
+        git -C $Dir pull -q --ff-only 2>$null
+        if ($LASTEXITCODE -ne 0) { Warn "Could not update it (local changes, or no network); using it as it is." }
     } else {
-        if ($hasHead) { Say "The local copy has edits or has diverged from GitHub; replacing it with the latest version" }
-        Backup-Bridge
-        # reset --hard drops local edits and overwrites untracked files at the repo's paths (a hand-made copy
-        # has those); checkout alone would carry the edits over. Then the branch is named main.
-        git -C $Dir reset -q --hard origin/main
-        if ($LASTEXITCODE -eq 0) { git -C $Dir checkout -q -B main origin/main }
-        if ($LASTEXITCODE -ne 0) { throw "Could not bring $Dir to the latest version; the old copy is in $script:Backup." }
+        Say "Bridge found in $Dir; using it as it is"
     }
-    git -C $Dir branch -q --set-upstream-to=origin/main main 2>$null | Out-Null
-    Say "Bridge at $((git -C $Dir log -1 --format='%h %s') -join '')"
+} elseif ((Have git) -and -not (Test-Path (Join-Path $Dir "*"))) {
+    Say "Installing the bridge into $Dir"
+    New-Item -ItemType Directory -Force (Split-Path $Dir) | Out-Null
+    git clone -q $Repo $Dir
+    if ($LASTEXITCODE -ne 0) { throw "git clone failed." }
 } else {
-    Say "Downloading the bridge into $Dir"
+    # no git, or a folder that holds other files but no bridge: add the bridge's files beside them
+    Say "Installing the bridge into $Dir"
     $zip = Join-Path $env:TEMP "claude-flash-bridge.zip"
     $tmp = Join-Path $env:TEMP "claude-flash-bridge-unzip"
-    Invoke-WebRequest "$Repo/archive/refs/heads/main.zip" -OutFile $zip
+    Invoke-WebRequest "$Repo/archive/refs/heads/main.zip" -OutFile $zip -UseBasicParsing
     Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue
     Expand-Archive $zip $tmp
     New-Item -ItemType Directory -Force $Dir | Out-Null
@@ -130,5 +119,6 @@ if ($auth -notmatch '(?im)^\s*\S.*\bdeepseek\b.*\bstored\b') {
 
 # 7. Agents, Claude Code and Claude Desktop registration, smoke test
 Say "Registering the bridge"
+if (-not (Test-Path (Join-Path $Dir "install.mjs"))) { throw "$Dir has no install.mjs (an old copy?); register it by hand or delete the folder and run this again." }
 Push-Location $Dir
 try { node install.mjs } finally { Pop-Location }

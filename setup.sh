@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # One-step setup and update of the deepseek-flash bridge on macOS and Linux:
 #   curl -fsSL https://raw.githubusercontent.com/Kaan88/claude-flash-bridge/main/setup.sh | bash
-# Installs what is missing (Claude Code, OpenCode; Node.js through Homebrew on macOS), clones or updates
-# this repo in ~/.claude/mcp-servers/opencode-agent, signs OpenCode in to DeepSeek if it has no key yet
+# Installs only what is missing: Claude Code, OpenCode, Node.js (through Homebrew on macOS) and this bridge. A
+# bridge already installed is used where it is (the copy Claude is registered with, else
+# ~/.claude/mcp-servers/opencode-agent; a git clone is updated). Signs OpenCode in to DeepSeek if it has no key yet
 # (the key is typed into OpenCode's own prompt and never passes through this script), then runs install.mjs.
 # Safe to run again. FLASH_BRIDGE_UPGRADE=1 also upgrades OpenCode to its latest release.
 set -euo pipefail
@@ -49,49 +50,38 @@ fi
 have opencode || { echo "OpenCode still not found after installing; open a new terminal and run this again." >&2; exit 1; }
 say "OpenCode $(opencode --version)"
 
-# 4. The bridge itself. An existing copy is adopted, whatever made it: a clone is fast-forwarded; a copy
-# made by hand, an archive, or a clone with local edits is backed up next to it first, then brought to the
-# latest version in place.
-BACKUP=""
-backup_bridge() {
-  [ -n "$BACKUP" ] && return
-  BACKUP="$DIR.bak-$(date +%Y%m%d-%H%M%S)"
-  cp -R "$DIR" "$BACKUP"
-  say "Backed up the existing copy to $BACKUP"
+# 4. The bridge itself: an installed copy is used as it is; only a missing one is installed.
+# A copy registered in Claude Code or Claude Desktop is found wherever it lives, not only in $DIR.
+registered="$(node - 2>/dev/null <<'EOF' || true
+const fs = require("fs"), os = require("os"), p = require("path");
+const desktop = process.platform === "win32" ? p.join(process.env.APPDATA || "", "Claude", "claude_desktop_config.json")
+  : process.platform === "darwin" ? p.join(os.homedir(), "Library", "Application Support", "Claude", "claude_desktop_config.json")
+  : p.join(os.homedir(), ".config", "Claude", "claude_desktop_config.json");
+for (const f of [p.join(os.homedir(), ".claude.json"), desktop]) {
+  try {
+    const s = (JSON.parse(fs.readFileSync(f, "utf8")).mcpServers || {})["deepseek-flash"];
+    const server = ((s && s.args) || []).find((a) => /server\.mjs$/.test(a));
+    if (server && fs.existsSync(server)) { console.log(p.dirname(server)); break; }
+  } catch {}
 }
-g() { git -C "$DIR" "$@"; }
+EOF
+)"
+[ -n "$registered" ] && DIR="$registered"
 
-if have git && [ ! -e "$DIR" ]; then
-  say "Cloning the bridge into $DIR"
-  mkdir -p "$(dirname "$DIR")"
-  git clone "$REPO" "$DIR"
-elif have git; then
-  say "Updating the bridge in $DIR"
-  if [ ! -d "$DIR/.git" ]; then
-    say "The existing copy is not a git clone; converting it"
-    backup_bridge
-    g init -q
-  fi
-  g remote get-url origin >/dev/null 2>&1 || g remote add origin "$REPO"
-  g fetch -q origin main || { echo "git fetch from $REPO failed." >&2; exit 1; }
-  has_head=0; g rev-parse --verify -q HEAD >/dev/null && has_head=1
-  dirty=0; [ "$has_head" = 1 ] && [ -n "$(g status --porcelain --untracked-files=no)" ] && dirty=1
-  if [ "$has_head" = 1 ] && [ "$dirty" = 0 ] && g merge-base --is-ancestor HEAD origin/main; then
-    g merge -q --ff-only origin/main
-  elif [ "$has_head" = 1 ] && [ "$dirty" = 0 ] && g merge-base --is-ancestor origin/main HEAD; then
-    warn "The local copy has commits GitHub does not have; kept as it is."
+if [ -f "$DIR/server.mjs" ]; then
+  if [ -d "$DIR/.git" ] && have git; then
+    say "Bridge found in $DIR; updating it"
+    git -C "$DIR" pull -q --ff-only 2>/dev/null || warn "Could not update it (local changes, or no network); using it as it is."
   else
-    [ "$has_head" = 1 ] && say "The local copy has edits or has diverged from GitHub; replacing it with the latest version"
-    backup_bridge
-    # reset --hard drops local edits and overwrites untracked files at the repo's paths (a hand-made copy
-    # has those); checkout alone would carry the edits over. Then the branch is named main.
-    { g reset -q --hard origin/main && g checkout -q -B main origin/main; } ||
-      { echo "Could not bring $DIR to the latest version; the old copy is in $BACKUP." >&2; exit 1; }
+    say "Bridge found in $DIR; using it as it is"
   fi
-  g branch -q --set-upstream-to=origin/main main >/dev/null 2>&1 || true
-  say "Bridge at $(g log -1 --format='%h %s')"
+elif have git && [ -z "$(ls -A "$DIR" 2>/dev/null)" ]; then
+  say "Installing the bridge into $DIR"
+  mkdir -p "$(dirname "$DIR")"
+  git clone -q "$REPO" "$DIR"
 else
-  say "Downloading the bridge into $DIR"
+  # no git, or a folder that holds other files but no bridge: add the bridge's files beside them
+  say "Installing the bridge into $DIR"
   tmp="$(mktemp -d)"
   curl -fsSL "$REPO/archive/refs/heads/main.tar.gz" | tar -xz -C "$tmp"
   mkdir -p "$DIR"
@@ -110,4 +100,5 @@ fi
 
 # 6. Agents, Claude Code and Claude Desktop registration, smoke test
 say "Registering the bridge"
+[ -f "$DIR/install.mjs" ] || { echo "$DIR has no install.mjs (an old copy?); register it by hand or delete the folder and run this again." >&2; exit 1; }
 cd "$DIR" && node install.mjs
