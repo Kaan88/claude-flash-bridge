@@ -39,7 +39,7 @@ function findOpencode() {
 const opencode = findOpencode();
 // Off-PATH installs are handed to the server through OPENCODE_EXE.
 const onPath = opencode && (process.env.PATH || "").split(delimiter).some((d) => opencode.startsWith(d));
-const serverEnv = { OPENCODE_TIMEOUT_MS: "1800000", ...(opencode && !onPath ? { OPENCODE_EXE: opencode } : {}) };
+const serverEnv = { OPENCODE_TIMEOUT_MS: "3600000", ...(opencode && !onPath ? { OPENCODE_EXE: opencode } : {}) };
 opencode ? ok(`OpenCode: ${opencode}`) : warn("OpenCode executable not found; set OPENCODE_EXE=<full path to opencode.exe> and re-run");
 
 // Accepts JSONC: strips comments and trailing commas (outside strings) before parsing.

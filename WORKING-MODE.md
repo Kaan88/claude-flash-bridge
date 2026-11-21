@@ -33,8 +33,10 @@ Never use `none` for anything that needs reasoning.
 `deepseek_flash` returns at once with a job id; it does not wait for the work. Get the reply with
 `deepseek_flash_result { job }`, which waits up to ~55 s per call and says "still running" until the job is done.
 Start parallel jobs first, then collect their results; don't redo or re-send a job that is still running, and
-don't start a second job on the same files while one may still be editing them. If a job is reported unknown
-(the server restarted), review whatever it left in `git diff` instead.
+don't start a second job on the same files while one may still be editing them. A job that runs long builds or
+test suites gets a larger `timeout_seconds`; `deepseek_flash_cancel { job }` stops one that went wrong. A
+timed-out, cancelled or lost job returns a short summary (session, files edited, last text, log path): review
+whatever it left in `git diff`, or continue its session to finish.
 
 Every reply ends with `session: ses_…`. Keep one session per task and pass it as `session` for every follow-up
 on that task: fix rounds, next steps, questions. Send only the new information. Do not resend the spec.
