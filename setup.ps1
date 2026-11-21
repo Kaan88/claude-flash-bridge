@@ -61,17 +61,50 @@ if (-not (Have opencode)) {
 if (-not (Have opencode)) { throw "OpenCode still not found after installing; open a new terminal and run this again." }
 Say "OpenCode $((opencode --version) -join ' ')"
 
-# 5. The bridge itself
-if (Test-Path (Join-Path $Dir ".git")) {
-    Say "Updating the bridge in $Dir"
-    git -C $Dir pull --ff-only
-    if ($LASTEXITCODE -ne 0) { Warn "git pull failed (local changes?); keeping the current copy." }
-} elseif (Have git) {
-    if (Test-Path $Dir) { throw "$Dir exists but is not a git clone; move it away and run this again." }
+# 5. The bridge itself. An existing copy is adopted, whatever made it: a clone is fast-forwarded; a copy
+# made by hand, a zip, or a clone with local edits is backed up next to it first, then brought to the
+# latest version in place (no rename: a running session can hold the folder open on Windows).
+$script:Backup = $null
+function Backup-Bridge {
+    if ($script:Backup) { return }
+    $script:Backup = "$Dir.bak-$(Get-Date -Format yyyyMMdd-HHmmss)"
+    Copy-Item -Recurse -Force $Dir $script:Backup
+    Say "Backed up the existing copy to $script:Backup"
+}
+function Git-Ok { & git -C $Dir @args 2>$null | Out-Null; $LASTEXITCODE -eq 0 }
+
+if ((Have git) -and -not (Test-Path $Dir)) {
     Say "Cloning the bridge into $Dir"
     New-Item -ItemType Directory -Force (Split-Path $Dir) | Out-Null
     git clone $Repo $Dir
     if ($LASTEXITCODE -ne 0) { throw "git clone failed." }
+} elseif (Have git) {
+    Say "Updating the bridge in $Dir"
+    if (-not (Test-Path (Join-Path $Dir ".git"))) {
+        Say "The existing copy is not a git clone; converting it"
+        Backup-Bridge
+        git -C $Dir init -q
+    }
+    if (-not (Git-Ok remote get-url origin)) { git -C $Dir remote add origin $Repo }
+    git -C $Dir fetch -q origin main
+    if ($LASTEXITCODE -ne 0) { throw "git fetch from $Repo failed." }
+    $hasHead = Git-Ok rev-parse --verify -q HEAD
+    $dirty = $hasHead -and [bool](git -C $Dir status --porcelain --untracked-files=no)
+    if ($hasHead -and -not $dirty -and (Git-Ok merge-base --is-ancestor HEAD origin/main)) {
+        git -C $Dir merge -q --ff-only origin/main
+    } elseif ($hasHead -and -not $dirty -and (Git-Ok merge-base --is-ancestor origin/main HEAD)) {
+        Warn "The local copy has commits GitHub does not have; kept as it is."
+    } else {
+        if ($hasHead) { Say "The local copy has edits or has diverged from GitHub; replacing it with the latest version" }
+        Backup-Bridge
+        # reset --hard drops local edits and overwrites untracked files at the repo's paths (a hand-made copy
+        # has those); checkout alone would carry the edits over. Then the branch is named main.
+        git -C $Dir reset -q --hard origin/main
+        if ($LASTEXITCODE -eq 0) { git -C $Dir checkout -q -B main origin/main }
+        if ($LASTEXITCODE -ne 0) { throw "Could not bring $Dir to the latest version; the old copy is in $script:Backup." }
+    }
+    git -C $Dir branch -q --set-upstream-to=origin/main main 2>$null | Out-Null
+    Say "Bridge at $((git -C $Dir log -1 --format='%h %s') -join '')"
 } else {
     Say "Downloading the bridge into $Dir"
     $zip = Join-Path $env:TEMP "claude-flash-bridge.zip"

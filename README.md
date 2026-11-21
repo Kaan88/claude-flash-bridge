@@ -52,7 +52,10 @@ The same command installs and updates. It:
 
 1. installs what is missing: Node.js (winget on Windows, Homebrew on macOS), Git (Windows; otherwise the repo
    comes as an archive), Claude Code (its official installer) and OpenCode (`npm i -g @opencode/cli`);
-2. clones this repo to `~/.claude/mcp-servers/opencode-agent`, or `git pull`s it when it is already there;
+2. clones this repo to `~/.claude/mcp-servers/opencode-agent`, or brings an existing copy there to the latest
+   version: a clean clone is fast-forwarded; a copy made by hand or from a zip, or a clone with local edits, is
+   first backed up next to it (`opencode-agent.bak-<time>`) and then converted in place; a clone with local
+   commits GitHub doesn't have is left alone;
 3. asks for a DeepSeek API key only when OpenCode has none: it runs `opencode auth login deepseek`, so the key
    goes straight into OpenCode's own store and never through the script, a file or the command line;
 4. runs `node install.mjs` (below).
