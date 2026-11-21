@@ -34,7 +34,33 @@ Finished jobs are kept in memory for 24 hours, and their files stay in the state
 Without `allow_edits` the job runs the read-only agent `deepseek-flash-ro`, which can't edit files (OpenCode
 permissions), but can still read files and run commands such as tests.
 
-## Install on a new PC
+## Install or update in one step
+
+Windows (PowerShell):
+
+```powershell
+irm https://raw.githubusercontent.com/Kaan88/claude-flash-bridge/main/setup.ps1 | iex
+```
+
+macOS / Linux:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/Kaan88/claude-flash-bridge/main/setup.sh | bash
+```
+
+The same command installs and updates. It:
+
+1. installs what is missing: Node.js (winget on Windows, Homebrew on macOS), Git (Windows; otherwise the repo
+   comes as an archive), Claude Code (its official installer) and OpenCode (`npm i -g @opencode/cli`);
+2. clones this repo to `~/.claude/mcp-servers/opencode-agent`, or `git pull`s it when it is already there;
+3. asks for a DeepSeek API key only when OpenCode has none: it runs `opencode auth login deepseek`, so the key
+   goes straight into OpenCode's own store and never through the script, a file or the command line;
+4. runs `node install.mjs` (below).
+
+Anything already installed is left as it is. Set `FLASH_BRIDGE_UPGRADE=1` (`$env:FLASH_BRIDGE_UPGRADE = "1"`)
+to also upgrade OpenCode to its latest release.
+
+## Install by hand
 
 Needs Node 18+, OpenCode, and Claude Code and/or Claude Desktop.
 
