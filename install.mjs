@@ -134,6 +134,14 @@ editJson(desktop, (c) => {
   c.mcpServers["deepseek-flash"] = { command: node, args: [server], env: serverEnv };
 });
 
+// Claude Code's own wait on a tool call; jobs return at once now, so this is only a safety net.
+const settings = join(homedir(), ".claude", "settings.json");
+if (!existsSync(settings)) (mkdirSync(dirname(settings), { recursive: true }), writeFileSync(settings, "{}\n"));
+editJson(settings, (c) => {
+  c.env ??= {};
+  c.env.MCP_TOOL_TIMEOUT ??= "1800000";
+});
+
 // 4. Smoke test through OpenCode
 try {
   if (!opencode) throw new Error("OpenCode executable not found");
@@ -147,11 +155,3 @@ try {
   warn(`OpenCode smoke test failed (is the deepseek provider signed in? run: opencode auth): ${e.message.split("\n")[0]}`);
 }
 console.log("\nDone. Fully quit Claude Desktop (tray icon too) and reopen; start a new Claude Code session.");
-
-// Claude Code's own wait on a tool call; jobs return at once now, so this is only a safety net.
-const settings = join(homedir(), ".claude", "settings.json");
-if (!existsSync(settings)) (mkdirSync(dirname(settings), { recursive: true }), writeFileSync(settings, "{}\n"));
-editJson(settings, (c) => {
-  c.env ??= {};
-  c.env.MCP_TOOL_TIMEOUT ??= "1800000";
-});
