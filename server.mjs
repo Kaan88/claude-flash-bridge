@@ -6,7 +6,12 @@
 // <tmp>/opencode-agent): every job writes <id>.json (status, session, progress, the capped reply) and
 // <id>.jsonl (OpenCode's raw event stream). Any instance can answer or cancel any job, and a reply
 // never carries the raw log: a timed-out or failed job returns a short summary plus the log's path.
-import { spawn } from "node:child_process";
+//
+// The models, their real effort levels (OpenCode "variants") and the agents are read from OpenCode when the
+// server starts (`opencode api model.list` / `agent.list`), cached per project folder, and written compactly
+// into the tool description; Claude is told (tools/list_changed) when a refresh changes them.
+import { execFile, spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import { createWriteStream, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { createInterface } from "node:readline";
 import { tmpdir } from "node:os";
@@ -55,14 +60,252 @@ async function limited(fn) {
   }
 }
 
-const TOOL = {
+// ---- model and agent catalog, read live from OpenCode ----
+
+const EFFORT_LADDER = ["none", "minimal", "low", "medium", "high", "xhigh", "max"];
+const FALLBACK_EFFORTS = ["none", "low", "high", "max"];
+// OpenCode's own free models (opencode provider, "-free" or zero cost) are left out unless OPENCODE_INCLUDE_FREE=1.
+// Zero cost alone is not "free": subscription and local providers report $0 too, and are kept.
+const INCLUDE_FREE = process.env.OPENCODE_INCLUDE_FREE === "1";
+// Optional regex on "provider/id" to hide more models, e.g. "-(fast|flex|ultrafast)$|^openai/gpt-5".
+const EXCLUDE_RE = process.env.OPENCODE_MODEL_EXCLUDE ? new RegExp(process.env.OPENCODE_MODEL_EXCLUDE, "i") : null;
+const CATALOG_FILE = join(STATE_DIR, `catalog-${createHash("sha1").update(process.cwd().toLowerCase()).digest("hex").slice(0, 10)}.json`);
+const LOCAL_HOST = /^(localhost|127\.|10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.|\[?::1\]?$|[^.]+$|.*\.local$)/i;
+
+function ocApi(op) {
+  return new Promise((resolve, reject) => {
+    execFile(OPENCODE_EXE, ["api", op], { windowsHide: true, timeout: 20000, maxBuffer: 64 * 1024 * 1024 }, (err, out) => {
+      if (err) return reject(err);
+      try {
+        const j = JSON.parse(out);
+        resolve(j && typeof j === "object" && "data" in j ? j.data : j);
+      } catch (e) {
+        reject(e);
+      }
+    });
+  });
+}
+
+const refOf = (m) => `${m.providerID}/${m.id}`;
+const isFree = (m) => m.providerID === "opencode" && (/-free$/i.test(m.id) || (m.cost || []).every((c) => !c.input && !c.output));
+function isLocal(m) {
+  try {
+    return LOCAL_HOST.test(new URL(m.settings?.baseURL || "").hostname);
+  } catch {
+    return false;
+  }
+}
+
+async function fetchCatalog() {
+  const [models, agents, def] = await Promise.all([ocApi("model.list"), ocApi("agent.list"), ocApi("model.default").catch(() => null)]);
+  const all = new Map();
+  for (const m of models) {
+    if (m.enabled === false || (m.type && m.type !== "chat") || (m.status && !/^(active|beta)$/.test(m.status))) continue;
+    all.set(refOf(m), { ref: refOf(m), provider: m.providerID, id: m.id, efforts: (m.variants || []).map((v) => v.id), free: isFree(m), local: isLocal(m) });
+  }
+  // local servers come and go: probe each one (any HTTP answer = up), in parallel, 1.5 s at most
+  const bases = new Map();
+  for (const m of models) if (all.get(refOf(m))?.local && m.settings?.baseURL) bases.set(refOf(m), m.settings.baseURL.replace(/\/+$/, ""));
+  const up = new Map();
+  await Promise.all(
+    [...new Set(bases.values())].map((b) =>
+      fetch(`${b}/models`, { signal: AbortSignal.timeout(1500) }).then(
+        () => up.set(b, true),
+        () => up.set(b, false),
+      ),
+    ),
+  );
+  for (const [ref, b] of bases) all.get(ref).offline = !up.get(b);
+  // what an agent runs on: its own model and variant, else OpenCode's default model
+  const agentModel = (a) => (a.model?.id ? `${a.model.providerID}/${a.model.id}${a.model.variant ? `#${a.model.variant}` : ""}` : def ? `${refOf(def)} (default)` : "default model");
+  return {
+    at: Date.now(),
+    // every enabled model, free ones included, so a job on an agent's own (possibly free) model still validates
+    models: [...all.values()],
+    agents: agents
+      .filter((a) => !a.hidden || a.id === READONLY_AGENT)
+      .map((a) => ({ name: a.id, hidden: !!a.hidden, mode: a.mode, model: agentModel(a), description: (a.description || "").split(/(?<=\.)\s/)[0].slice(0, 90) })),
+    defaultModel: def ? refOf(def) : null,
+  };
+}
+
+function readCachedCatalog() {
+  try {
+    const c = JSON.parse(readFileSync(CATALOG_FILE, "utf8"));
+    return Array.isArray(c.models) && Array.isArray(c.agents) ? c : null;
+  } catch {
+    return null;
+  }
+}
+
+let catalog = readCachedCatalog();
+let catalogError = "";
+let refreshing = null;
+let clientReady = false;
+
+// Refreshes the catalog; when it changed after Claude already listed the tools, tells it to list them again.
+function refreshCatalog() {
+  refreshing ??= fetchCatalog()
+    .then((fresh) => {
+      catalogError = "";
+      const same = catalog && JSON.stringify({ ...catalog, at: 0 }) === JSON.stringify({ ...fresh, at: 0 });
+      catalog = fresh;
+      try {
+        writeFileSync(CATALOG_FILE, JSON.stringify(fresh));
+      } catch {
+        // cache is best effort
+      }
+      if (!same && clientReady) send({ jsonrpc: "2.0", method: "notifications/tools/list_changed" });
+    })
+    .catch((e) => {
+      catalogError = e.message.split("\n")[0].slice(0, 200);
+    })
+    .finally(() => {
+      refreshing = null;
+    });
+  return refreshing;
+}
+
+// A model's line and version: "claude-opus-4-5-20251101" -> line "claude-opus", version [4,5], date 20251101;
+// "gpt-6.2-sol-fast" -> line "gpt-sol-fast", version [6,2]. Only the newest version of each line is listed.
+const KEEP_OLD = process.env.OPENCODE_KEEP_OLD_MODELS === "1";
+function lineOf(m) {
+  const line = [];
+  const version = [];
+  let date = 0;
+  for (const t of m.id.split("-")) {
+    if (/^\d{8}$/.test(t)) date = Number(t);
+    else if (/^v?\d+(\.\d+)*$/i.test(t)) version.push(...t.replace(/^v/i, "").split(".").map(Number));
+    else line.push(t);
+  }
+  return { key: `${m.provider}/${line.join("-")}`, version, date };
+}
+function newer(a, b) {
+  for (let i = 0; i < Math.max(a.version.length, b.version.length); i++) {
+    const d = (a.version[i] || 0) - (b.version[i] || 0);
+    if (d) return d > 0;
+  }
+  return a.version.length !== b.version.length ? a.version.length > b.version.length : !a.date && !!b.date; // undated alias beats dated
+}
+function latestOnly(models) {
+  const best = new Map();
+  for (const m of models) {
+    if (m.local) continue; // local models are whatever the user loaded: all listed
+    const l = lineOf(m);
+    const cur = best.get(l.key);
+    if (!cur || newer(l, cur.l)) best.set(l.key, { m, l });
+  }
+  const keep = new Set([...best.values()].map((b) => b.m));
+  return models.filter((m) => m.local || keep.has(m));
+}
+
+const shownModels = () => {
+  const list = (catalog?.models || []).filter((m) => (INCLUDE_FREE || !m.free) && !(EXCLUDE_RE && EXCLUDE_RE.test(m.ref)));
+  return KEEP_OLD ? list : latestOnly(list);
+};
+const findModel = (ref) => catalog?.models.find((m) => m.ref.toLowerCase() === String(ref).toLowerCase());
+
+// "low-max" for a contiguous run of the ladder, else the levels listed
+function effortLabel(levels) {
+  if (!levels.length) return "no effort levels";
+  // "minimal" is rare: none,low,...,max still reads as none-max
+  const ladder = levels.includes("minimal") ? EFFORT_LADDER : EFFORT_LADDER.filter((l) => l !== "minimal");
+  const idx = levels.map((l) => ladder.indexOf(l));
+  const contiguous = idx.every((v, i) => v >= 0 && (i === 0 || v === idx[i - 1] + 1));
+  return contiguous && levels.length > 2 ? `${levels[0]}-${levels.at(-1)}` : levels.join(",");
+}
+
+// gpt-6-sol, gpt-6-sol-fast, gpt-6-sol-flex -> gpt-6-sol{,-fast,-flex}
+const SPEED_SUFFIX = /-(fast|flex|ultrafast|turbo|mini|nano|lite)$/;
+function compactIds(ids) {
+  const groups = new Map();
+  for (const id of ids) {
+    const base = id.replace(SPEED_SUFFIX, "");
+    if (!groups.has(base)) groups.set(base, []);
+    groups.get(base).push(id.slice(base.length));
+  }
+  return [...groups].map(([base, sfx]) => (sfx.length === 1 ? base + sfx[0] : `${base}{${sfx.join(",")}}`));
+}
+
+function catalogText() {
+  const models = shownModels();
+  if (!models.length) return catalogError ? ` (Model list unavailable: ${catalogError}; pass \`model\` as provider/id anyway.)` : "";
+  const byProvider = new Map();
+  for (const m of models) {
+    if (!byProvider.has(m.provider)) byProvider.set(m.provider, { local: m.local, offline: m.offline, groups: new Map() });
+    const p = byProvider.get(m.provider);
+    p.local &&= m.local;
+    p.offline &&= m.offline;
+    const key = effortLabel(m.efforts);
+    if (!p.groups.has(key)) p.groups.set(key, []);
+    p.groups.get(key).push(m.id);
+  }
+  const lines = [...byProvider].map(
+    ([prov, p]) => `${prov}${p.local ? (p.offline ? " (local, OFFLINE at startup)" : " (local)") : ""}: ` + [...p.groups].map(([lvl, ids]) => `[${lvl}] ${compactIds(ids).join(" ")}`).join("; "),
+  );
+  const agents = (catalog?.agents || []).filter((a) => !a.hidden).map((a) => `${a.name} (${a.mode}, ${a.model})${a.description ? `: ${a.description}` : ""}`);
+  return (
+    "\n\nModels for `model` (provider/id; {,-fast} = id and id-fast); `effort` must be one of the model's levels in brackets:\n" +
+    lines.join("\n") +
+    (agents.length ? `\n\nAgents for \`agent\`:\n${agents.join("\n")}` : "")
+  );
+}
+
+// The model a job runs on, for checking `effort`: the explicit `model`, else the agent's own model.
+function resolveModel(args) {
+  if (args.model) return String(args.model).replace(/#.*$/, "");
+  const name = args.agent || (args.allow_edits ? DEFAULT_AGENT : READONLY_AGENT);
+  const a = catalog?.agents.find((x) => x.name === name);
+  if (a) return a.model.replace(/#.*$|\s.*$/, "");
+  return name === DEFAULT_AGENT || name === READONLY_AGENT ? MODEL : catalog?.defaultModel || MODEL;
+}
+
+// Checks `model`, `effort` and `agent` against the catalog (refreshed once on a miss); returns an error text or "".
+async function validate(args) {
+  if (args.model && String(args.model).includes("#") && !args.effort) {
+    const [m, e] = String(args.model).split("#");
+    args.model = m;
+    args.effort = e;
+  }
+  if (!catalog && refreshing) await Promise.race([refreshing, new Promise((r) => setTimeout(r, 10000))]);
+  if (!catalog) return ""; // no catalog: let OpenCode judge
+  const check = () => {
+    if (args.agent && !catalog.agents.some((a) => a.name === args.agent)) return `unknown agent "${args.agent}". Agents: ${catalog.agents.filter((a) => !a.hidden).map((a) => a.name).join(", ")}`;
+    const ref = resolveModel(args);
+    const m = findModel(ref);
+    if (args.model && !m) {
+      // rank listed models by the name parts they share with the request
+      const parts = String(args.model).toLowerCase().split(/[/\-.]/).filter(Boolean);
+      const near = shownModels()
+        .map((x) => ({ ref: x.ref, n: parts.filter((p) => x.ref.toLowerCase().split(/[/\-.]/).includes(p)).length }))
+        .filter((x) => x.n)
+        .sort((a, b) => b.n - a.n)
+        .slice(0, 5)
+        .map((x) => x.ref);
+      return `unknown model "${args.model}"${near.length ? `. Close matches: ${near.join(", ")}` : ""}`;
+    }
+    if (m) args.model &&= m.ref; // exact casing
+    if (args.effort && m && !m.efforts.includes(args.effort))
+      return m.efforts.length ? `${m.ref} has effort levels ${m.efforts.join(", ")}; "${args.effort}" is not one of them` : `${m.ref} has no effort levels; leave \`effort\` out`;
+    return "";
+  };
+  let err = check();
+  if (err && Date.now() - catalog.at > 10000) {
+    await refreshCatalog();
+    err = check();
+  }
+  return err;
+}
+
+const buildTool = () => ({
   name: "deepseek_flash",
   description:
-    "Start a task on the DeepSeek Flash agent (run through OpenCode). Returns AT ONCE with a job id; get the answer (plus its session id) with `deepseek_flash_result`. " +
+    "Start a task on an OpenCode agent (default DeepSeek Flash; any model below via `model`). Returns AT ONCE with a job id; get the answer (plus its session id) with `deepseek_flash_result`. " +
     "A new session starts with NO context: put everything it needs in `prompt` (paths, goal, constraints, expected output format). " +
     "Pass `session` to continue an earlier conversation (fix rounds, follow-ups) without resending context. " +
-    `At most ${MAX_CONCURRENT} calls run at once per server; extra calls wait. Without \`allow_edits\` the agent cannot edit files (enforced by OpenCode permissions). ` +
-    `A job is stopped after \`timeout_seconds\` (default ${TIMEOUT_MS / 1000}) or after \`idle_seconds\` without any output (default ${IDLE_MS / 1000}).`,
+    `At most ${MAX_CONCURRENT} calls run at once per server; extra calls wait. Without \`allow_edits\` the agent cannot edit files (enforced by OpenCode permissions), whatever the model. ` +
+    `A job is stopped after \`timeout_seconds\` (default ${TIMEOUT_MS / 1000}) or after \`idle_seconds\` without any output (default ${IDLE_MS / 1000}).` +
+    catalogText(),
   inputSchema: {
     type: "object",
     properties: {
@@ -85,11 +328,15 @@ const TOOL = {
         description:
           "Session id returned by an earlier call (the `session:` line). Continues that conversation with all its context: send only the follow-up (review findings, next step), not the whole spec again.",
       },
+      model: {
+        type: "string",
+        description: `provider/id from the list below. Default: the agent's own model (${MODEL}#high for ${DEFAULT_AGENT}). Runs with the chosen agent's tools and permissions.`,
+      },
       effort: {
         type: "string",
-        enum: ["none", "low", "high", "max"],
+        enum: effortEnum(),
         description:
-          "Reasoning effort. Default high (implementation, review, debugging). low: summaries, lookups, mechanical edits. max: hard bugs, tricky algorithms, a second attempt after a failed fix round. none: trivial formatting/extraction.",
+          "Reasoning effort, one of the model's own levels (listed below). Omit for the agent's/model's default. low: summaries, lookups, mechanical edits. max: hard bugs, a second attempt after a failed fix round. none: trivial formatting/extraction.",
       },
       timeout_seconds: {
         type: "number",
@@ -99,11 +346,18 @@ const TOOL = {
         type: "number",
         description: `Stop the job when OpenCode prints nothing for this long. Default ${IDLE_MS / 1000}, at most the wall-clock limit.`,
       },
-      agent: { type: "string", description: `OpenCode agent name for a new session. Default ${DEFAULT_AGENT}.` },
+      agent: { type: "string", description: `OpenCode agent (list below) for a new session. Default ${DEFAULT_AGENT}, or ${READONLY_AGENT} without allow_edits.` },
     },
     required: ["prompt"],
   },
-};
+});
+
+// every level any listed model has, in ladder order
+function effortEnum() {
+  const used = new Set(shownModels().flatMap((m) => m.efforts));
+  const levels = EFFORT_LADDER.filter((l) => used.has(l));
+  return levels.length ? levels : FALLBACK_EFFORTS;
+}
 
 const RESULT_TOOL = {
   name: "deepseek_flash_result",
@@ -246,6 +500,9 @@ function absorb(job, acc, ev) {
     if (typeof part.cost === "number") acc.cost += part.cost;
     acc.reasoning += part.tokens?.reasoning || 0;
   }
+  // a provider that can't be reached shows up as retries, not errors: keep the latest so it's visible
+  if (ev.type === "retry") s.retry = `attempt ${ev.attempt}: ${String(ev.error?.message || "").slice(0, 160)}`;
+  else if (ev.type === "step_finish" || ev.type === "text") s.retry = "";
   if (ev.type === "error") acc.errors.push(cap(JSON.stringify(ev.error ?? part ?? ev), 1000, s.log));
   const tool = part.tool || (ev.type === "tool_use" ? ev.tool : "");
   if (tool) {
@@ -268,6 +525,7 @@ function summary(job, acc, status, reason) {
     `files edited: ${s.files.length ? s.files.join(", ") : "(none reported)"}`,
   ];
   if (acc.errors.length) lines.push(`errors: ${acc.errors.slice(-3).join("\n")}`);
+  if (s.retry) lines.push(`provider retrying (${s.retry})`);
   if (acc.stderr.trim()) lines.push(`stderr (tail): ${stripAnsi(acc.stderr).trim().slice(-800)}`);
   lines.push(`last text: ${last ? (last.length > LAST_TEXT ? "…" + last.slice(-LAST_TEXT) : last) : "(none)"}`);
   lines.push(`log: ${s.log}`);
@@ -285,7 +543,7 @@ function finish(job, status, reply, ok = false) {
   return s;
 }
 
-function runAgent(job, { prompt, directory, files = [], allow_edits = false, agent, session, effort }) {
+function runAgent(job, { prompt, directory, files = [], allow_edits = false, agent, session, effort, model }) {
   return new Promise((resolve) => {
     const s = job.state;
     if (isAbsolute(OPENCODE_EXE) && !existsSync(OPENCODE_EXE)) {
@@ -295,7 +553,9 @@ function runAgent(job, { prompt, directory, files = [], allow_edits = false, age
     const args = ["run", "--format", "json", "--archived", "--agent", chosen];
     if (session) args.push("--session", session);
     else args.push("--title", "claude-delegate");
-    if (effort && effort !== "high") args.push("--model", `${MODEL}#${effort}`);
+    // effort alone applies to the agent's own model, not always to OPENCODE_MODEL
+    const ref = model || (effort ? resolveModel({ agent, allow_edits }) : "");
+    if (ref) args.push("--model", effort ? `${ref}#${effort}` : ref);
     if (allow_edits) args.push("--auto");
     for (const f of files) args.push("--file", f);
 
@@ -423,7 +683,8 @@ function progress(s) {
   const quiet = s.lastEvent ? `, last output ${Math.round((now - s.lastEvent) / 1000)}s ago` : "";
   const tool = s.lastTool ? `, last tool ${s.lastTool}` : "";
   const files = s.files?.length ? `, ${s.files.length} file(s) edited` : "";
-  return `${s.id} still ${since}${quiet}${tool}${files} (limit ${s.timeoutMs / 1000}s, idle ${s.idleMs / 1000}s)`;
+  const retry = s.retry ? `, provider retrying (${s.retry})` : "";
+  return `${s.id} still ${since}${quiet}${tool}${files}${retry} (limit ${s.timeoutMs / 1000}s, idle ${s.idleMs / 1000}s)`;
 }
 
 const send = (msg) => process.stdout.write(JSON.stringify(msg) + "\n");
@@ -436,21 +697,32 @@ async function handle(msg) {
       id,
       result: {
         protocolVersion: params?.protocolVersion || "2025-06-18",
-        capabilities: { tools: {} },
-        serverInfo: { name: "opencode-agent", version: "1.2.0" },
+        capabilities: { tools: { listChanged: true } },
+        serverInfo: { name: "opencode-agent", version: "1.3.0" },
       },
     });
   }
-  if (method === "tools/list") return send({ jsonrpc: "2.0", id, result: { tools: [TOOL, RESULT_TOOL, CANCEL_TOOL] } });
+  if (method === "notifications/initialized") {
+    clientReady = true;
+    return;
+  }
+  if (method === "tools/list") {
+    // first run in this folder: wait (bounded) for the live list; otherwise the cache answers at once
+    if (!catalog && refreshing) await Promise.race([refreshing, new Promise((r) => setTimeout(r, 10000))]);
+    return send({ jsonrpc: "2.0", id, result: { tools: [buildTool(), RESULT_TOOL, CANCEL_TOOL] } });
+  }
   if (method === "tools/call") {
     const reply = (text, isError = false) => send({ jsonrpc: "2.0", id, result: { content: [{ type: "text", text }], isError } });
     const a = params?.arguments || {};
-    if (params?.name === TOOL.name) {
+    if (params?.name === "deepseek_flash") {
       if (!a.prompt) return reply("prompt is required", true);
+      const bad = await validate(a);
+      if (bad) return reply(bad, true);
       const waiting = running >= MAX_CONCURRENT ? ` (queued: ${MAX_CONCURRENT} jobs already running)` : "";
       const job = startJob(a);
       const s = jobs.get(job).state;
-      return reply(`started ${job}${waiting}, limit ${s.timeoutMs / 1000}s, idle ${s.idleMs / 1000}s. Get the answer with deepseek_flash_result { job: "${job}" }.`);
+      const on = a.model || a.effort ? ` on ${a.model || resolveModel(a)}${a.effort ? `#${a.effort}` : ""}` : "";
+      return reply(`started ${job}${on}${waiting}, limit ${s.timeoutMs / 1000}s, idle ${s.idleMs / 1000}s. Get the answer with deepseek_flash_result { job: "${job}" }.`);
     }
     if (params?.name === RESULT_TOOL.name) {
       const { job: jid, wait_seconds = 50 } = a;
@@ -511,6 +783,9 @@ function shutdown() {
 }
 process.stdin.on("end", shutdown);
 process.on("SIGTERM", shutdown);
+
+// read the live catalog now; with a cached one, tools/list doesn't wait for it
+refreshCatalog();
 
 createInterface({ input: process.stdin }).on("line", (line) => {
   if (!line.trim()) return;

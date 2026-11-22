@@ -28,7 +28,12 @@ into the prompt; let Flash read them. Keep tasks small enough to review in one d
 
 `effort`: leave at the default (high) for implementation, review and debugging. Use `low` for summaries,
 lookups and mechanical edits; `max` for hard bugs, tricky algorithms, or a fix round after a failed attempt.
-Never use `none` for anything that needs reasoning.
+Never use `none` for anything that needs reasoning. Each model has its own levels (listed in the tool description);
+a level the model lacks is refused with the valid ones.
+
+`model`: leave it out for Flash. The tool description lists every other OpenCode model (newest version of each,
+OpenCode's free models left out, local ones marked) as `provider/id`; pass one only when a task needs a
+stronger or different model than Flash. It runs with the same agent and the same read-only rule.
 
 `deepseek_flash` returns at once with a job id; it does not wait for the work. Get the reply with
 `deepseek_flash_result { job }`, which waits up to ~55 s per call and says "still running" until the job is done.

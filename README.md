@@ -8,9 +8,30 @@ coding on DeepSeek's API, which doesn't count against your Claude usage limits.
 
 | Tool | What it does |
 |---|---|
-| `deepseek_flash` | Starts a Flash job and returns **at once** with a job id (`job_k3x_2`). Inputs: `prompt`, `directory`, `allow_edits`, `session`, `effort` (`none`/`low`/`high`/`max`), `files`, `agent`, `timeout_seconds`, `idle_seconds`. |
+| `deepseek_flash` | Starts a Flash job and returns **at once** with a job id (`job_k3x_2`). Inputs: `prompt`, `directory`, `allow_edits`, `session`, `model` (any OpenCode model, `provider/id`), `effort` (that model's own levels), `files`, `agent`, `timeout_seconds`, `idle_seconds`. |
 | `deepseek_flash_result` | `{ job, wait_seconds? }`. Waits up to 55 s, then returns Flash's reply ending in `session: ses_…`, or one progress line while it runs (elapsed time, last output, last tool, files edited). |
 | `deepseek_flash_cancel` | `{ job }`. Stops a running job and its whole process tree (builds and tests included). Edits stay on disk; the session can be continued. |
+
+### Models, effort levels and agents (read live)
+
+When the server starts it asks OpenCode for its models and agents (`opencode api model.list` / `agent.list`,
+about a third of a second) and writes them into the `deepseek_flash` tool description in a compact form,
+grouped by provider and effort levels, e.g. `anthropic: [low-max] claude-opus-5-5{,-fast} ...`
+(about 500 tokens for ~30 models; Claude Code loads the schema only when the tool is used). The levels are each model's
+real OpenCode variants, so `effort` is checked per model and a wrong level or unknown model is refused with the valid
+choices. The list:
+
+- leaves out OpenCode's own free models (provider `opencode`, `-free` or zero cost; `OPENCODE_INCLUDE_FREE=1` keeps them).
+  Zero cost alone isn't "free": subscription and local providers report $0 and stay listed;
+- shows only the newest version of each model line (`claude-opus-5-5` hides `claude-opus-5`, `4-8`, ...;
+  `gpt-6.2-sol` hides `gpt-6.1-sol`); `OPENCODE_KEEP_OLD_MODELS=1` lists them all. Older ones can still be passed by name;
+- keeps every local model (localhost / private-network base URL), marked `(local)`, or `(local, OFFLINE at startup)`
+  when its server didn't answer a 1.5 s probe;
+- lists the visible agents with the model each runs on.
+
+The result is cached per project folder in the state folder, so a restart answers at once; when the live list differs,
+the server sends `tools/list_changed` and Claude re-reads it. An unknown model triggers one live re-read before it's refused.
+Passing `effort` without `model` now applies it to the chosen agent's own model (it used to always apply to `OPENCODE_MODEL`).
 
 The call returns at once so that a long job can never hit a tool-call timeout (it used to, and lost the reply
 while the edits landed anyway). At most 3 jobs run at a time per server (`OPENCODE_MAX_CONCURRENT`); further ones queue.
@@ -95,6 +116,9 @@ Each session runs its own copy of the server. After changing `server.mjs`: in a 
 | `OPENCODE_IDLE_MS` | 20 min | default limit without any output (`idle_seconds` overrides) |
 | `OPENCODE_MAX_CONCURRENT` | 3 | jobs running at once per server |
 | `OPENCODE_MAX_REPLY_CHARS` | 20000 | cap on any reply |
+| `OPENCODE_INCLUDE_FREE` | off | `1` lists OpenCode's own free models too |
+| `OPENCODE_KEEP_OLD_MODELS` | off | `1` lists older versions of each model line too |
+| `OPENCODE_MODEL_EXCLUDE` | none | regex on `provider/id` to hide more models, e.g. `-(flex|ultrafast)$` |
 | `OPENCODE_STATE_DIR` | `<tmp>/opencode-agent` | job state and raw logs, shared by every server copy |
 
 ## The working-mode prompt
