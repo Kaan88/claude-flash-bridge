@@ -14,7 +14,7 @@ import { execFile, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { createWriteStream, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { createInterface } from "node:readline";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { delimiter, isAbsolute, join } from "node:path";
 
 // The npm shim (opencode.cmd / opencode.ps1) mangles stdin, so find the real binary next to it.
@@ -30,6 +30,33 @@ function findOpencode() {
   return exe;
 }
 const OPENCODE_EXE = findOpencode();
+
+// Claude Code's own CLI as a second kind of worker: model "claude-code/<alias>" runs `claude -p`.
+function findClaude() {
+  if (process.env.CLAUDE_EXE) return process.env.CLAUDE_EXE;
+  if (process.env.OPENCODE_CLAUDE === "0") return "";
+  const names = process.platform === "win32" ? ["claude.exe"] : ["claude"];
+  const dirs = [...(process.env.PATH || "").split(delimiter), join(homedir(), ".local", "bin"), join(homedir(), ".claude", "local")];
+  for (const dir of dirs) for (const n of names) if (dir && existsSync(join(dir, n))) return join(dir, n);
+  return "";
+}
+const CLAUDE_EXE = findClaude();
+const CLAUDE_PROVIDER = "claude-code";
+const CLAUDE_EFFORTS = ["low", "medium", "high", "xhigh", "max"];
+const CLAUDE_MODELS = CLAUDE_EXE
+  ? ["fable", "opus", "sonnet", "haiku"].map((id) => ({ ref: `${CLAUDE_PROVIDER}/${id}`, provider: CLAUDE_PROVIDER, id, efforts: CLAUDE_EFFORTS, free: false, local: false }))
+  : [];
+// Claude sessions are UUIDs, OpenCode's start with "ses_": a session alone says which worker continues it.
+const CLAUDE_SESSION = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const isClaudeJob = (a) => String(a.model || "").startsWith(`${CLAUDE_PROVIDER}/`) || CLAUDE_SESSION.test(String(a.session || ""));
+// What a read-only Claude job may do: read, search, look things up, and run read-only git commands.
+const CLAUDE_READ_TOOLS = ["Read", "Grep", "Glob", "WebFetch", "WebSearch", "Bash(git status*)", "Bash(git diff*)", "Bash(git log*)", "Bash(git show*)"];
+// The host session's CLAUDE_* variables would tie the worker to it (its session id, messaging socket): drop them.
+function claudeEnv(cwd) {
+  const env = { ...process.env, PWD: cwd };
+  for (const k of Object.keys(env)) if (/^CLAUDE/i.test(k)) delete env[k];
+  return env;
+}
 const DEFAULT_AGENT = process.env.OPENCODE_AGENT || "deepseek-flash";
 // Read-only jobs run without --auto, so an agent whose edits and shell commands are "ask" can't change anything:
 // OpenCode rejects every ask when nobody can answer. Such an agent serves both kinds of job. An older install's
@@ -287,11 +314,12 @@ function latestOnly(models) {
   return models.filter((m) => m.local || keep.has(m));
 }
 
+const allModels = () => [...(catalog?.models || []), ...CLAUDE_MODELS];
 const shownModels = () => {
-  const list = (catalog?.models || []).filter((m) => (INCLUDE_FREE || !m.free) && !(EXCLUDE_RE && EXCLUDE_RE.test(m.ref)));
+  const list = allModels().filter((m) => (INCLUDE_FREE || !m.free) && !(EXCLUDE_RE && EXCLUDE_RE.test(m.ref)));
   return KEEP_OLD ? list : latestOnly(list);
 };
-const findModel = (ref) => catalog?.models.find((m) => m.ref.toLowerCase() === String(ref).toLowerCase());
+const findModel = (ref) => allModels().find((m) => m.ref.toLowerCase() === String(ref).toLowerCase());
 
 // "low-max" for a contiguous run of the ladder, else the levels listed
 function effortLabel(levels) {
@@ -337,7 +365,11 @@ function catalogText() {
   return (
     "\n\nModels for `model` (provider/id; {,-fast} = id and id-fast); `effort` must be one of the model's levels in brackets:\n" +
     lines.join("\n") +
-    (agents.length ? `\n\nAgents for \`agent\`:\n${agents.join("\n")}` : "")
+    (agents.length ? `\n\nAgents for \`agent\`:\n${agents.join("\n")}` : "") +
+    (CLAUDE_MODELS.length
+      ? `\n\n${CLAUDE_PROVIDER}/* runs Claude Code itself (\`claude -p\`, on your Claude plan) with its full toolset and CLAUDE.md, but no MCP servers; \`agent\` doesn't apply. ` +
+        "Read-only jobs can read, search, fetch web pages and run git status/diff/log/show; edit jobs run in Claude's auto permission mode. Its session ids are UUIDs."
+      : "")
   );
 }
 
@@ -363,6 +395,14 @@ async function validate(args) {
     const [m, e] = String(args.model).split("#");
     args.model = m;
     args.effort = e;
+  }
+  if (isClaudeJob(args)) {
+    if (!CLAUDE_EXE) return "Claude Code's CLI (claude) was not found; set CLAUDE_EXE";
+    if (args.agent) return "`agent` applies to OpenCode jobs only; a claude-code/* job runs Claude Code itself";
+    if (args.model && !findModel(args.model)) return `unknown model "${args.model}". Claude Code models: ${CLAUDE_MODELS.map((m) => m.ref).join(", ")}`;
+    if (args.effort && !CLAUDE_EFFORTS.includes(args.effort)) return `Claude Code effort levels are ${CLAUDE_EFFORTS.join(", ")}`;
+    if (args.session && !CLAUDE_SESSION.test(args.session)) return "that session is an OpenCode one; continue it without a claude-code model";
+    return "";
   }
   if (!catalog && refreshing) await Promise.race([refreshing, new Promise((r) => setTimeout(r, 10000))]);
   if (!catalog) return ""; // no catalog: let OpenCode judge
@@ -648,31 +688,69 @@ function finish(job, status, reply, ok = false) {
   return s;
 }
 
+// Reads one Claude Code stream-json event into the job's running summary.
+function absorbClaude(job, acc, ev) {
+  const s = job.state;
+  if (ev.session_id && !s.session) s.session = ev.session_id;
+  if (ev.type === "assistant")
+    for (const c of ev.message?.content || []) {
+      if (c.type === "text" && c.text) acc.texts.push(c.text);
+      if (c.type === "tool_use") {
+        s.lastTool = c.name;
+        const file = c.input?.file_path || c.input?.notebook_path;
+        if (typeof file === "string" && /^(Edit|Write|MultiEdit|NotebookEdit)$/.test(c.name) && !s.files.includes(file)) s.files.push(file);
+      }
+    }
+  if (ev.type === "system" && ev.subtype === "api_retry") s.retry = `attempt ${ev.attempt}: ${String(ev.error || "").slice(0, 160)}`;
+  else if (ev.type === "assistant") s.retry = "";
+  if (ev.type === "result") {
+    if (typeof ev.result === "string") acc.final = ev.result;
+    acc.cost += ev.total_cost_usd || 0;
+    if (ev.is_error) acc.errors.push(String(ev.result || ev.subtype || "error").slice(0, 1000));
+  }
+}
+
 function runAgent(job, { prompt, directory, files = [], allow_edits = false, agent, session, effort, model }) {
   return new Promise((resolve) => {
     const s = job.state;
-    if (isAbsolute(OPENCODE_EXE) && !existsSync(OPENCODE_EXE)) {
-      return resolve(finish(job, "failed", `opencode executable not found: ${OPENCODE_EXE} (set OPENCODE_EXE)`));
+    const claude = isClaudeJob({ model, session });
+    let exe = OPENCODE_EXE;
+    let args;
+    if (claude) {
+      exe = CLAUDE_EXE;
+      // headless, JSON events, no MCP servers (so a worker never starts this bridge again);
+      // edit jobs use auto mode (Claude's own safety check approves actions), read-only jobs don't-ask mode
+      args = ["-p", "--output-format", "stream-json", "--verbose", "--strict-mcp-config", "--permission-mode", allow_edits ? "auto" : "dontAsk"];
+      if (model) args.push("--model", String(model).slice(CLAUDE_PROVIDER.length + 1));
+      if (effort) args.push("--effort", effort);
+      if (session) args.push("--resume", session);
+      if (!allow_edits) args.push("--allowedTools", ...CLAUDE_READ_TOOLS); // variadic: keep it last
+      if (files.length) prompt = `${prompt}\n\nFiles to read first:\n${files.join("\n")}`;
+    } else {
+      if (isAbsolute(OPENCODE_EXE) && !existsSync(OPENCODE_EXE)) {
+        return resolve(finish(job, "failed", `opencode executable not found: ${OPENCODE_EXE} (set OPENCODE_EXE)`));
+      }
+      const chosen = pickAgent({ agent, allow_edits });
+      args = ["run", "--format", "json", "--archived", "--agent", chosen];
+      if (session) args.push("--session", session);
+      else args.push("--title", "claude-delegate");
+      // effort alone applies to the agent's own model, not always to OPENCODE_MODEL
+      const ref = model || (effort ? resolveModel({ agent, allow_edits }) : "");
+      if (ref) args.push("--model", effort ? `${ref}#${effort}` : ref);
+      if (allow_edits) args.push("--auto");
+      for (const f of files) args.push("--file", f);
     }
-    const chosen = pickAgent({ agent, allow_edits });
-    const args = ["run", "--format", "json", "--archived", "--agent", chosen];
-    if (session) args.push("--session", session);
-    else args.push("--title", "claude-delegate");
-    // effort alone applies to the agent's own model, not always to OPENCODE_MODEL
-    const ref = model || (effort ? resolveModel({ agent, allow_edits }) : "");
-    if (ref) args.push("--model", effort ? `${ref}#${effort}` : ref);
-    if (allow_edits) args.push("--auto");
-    for (const f of files) args.push("--file", f);
+    const take = claude ? absorbClaude : absorb;
 
     const acc = { texts: [], errors: [], cost: 0, reasoning: 0, stderr: "" };
     const log = createWriteStream(s.log);
     let child;
     try {
       const cwd = directory && existsSync(directory) ? directory : process.cwd();
-      child = spawn(OPENCODE_EXE, args, {
+      child = spawn(exe, args, {
         cwd,
         // OpenCode takes its working folder from PWD when set, and an inherited PWD is this server's folder
-        env: { ...process.env, PWD: cwd },
+        env: claude ? claudeEnv(cwd) : { ...process.env, PWD: cwd },
         stdio: ["pipe", "pipe", "pipe"],
         windowsHide: true,
         detached: process.platform !== "win32",
@@ -721,7 +799,7 @@ function runAgent(job, { prompt, directory, files = [], allow_edits = false, age
       for (const line of lines) {
         if (!line.trim().startsWith("{")) continue;
         try {
-          absorb(job, acc, JSON.parse(line));
+          take(job, acc, JSON.parse(line));
         } catch {
           // a non-JSON line: kept in the log only
         }
@@ -740,12 +818,12 @@ function runAgent(job, { prompt, directory, files = [], allow_edits = false, age
       if (ended) return;
       if (pending.trim().startsWith("{")) {
         try {
-          absorb(job, acc, JSON.parse(pending));
+          take(job, acc, JSON.parse(pending));
         } catch {
           // ignore
         }
       }
-      const text = clean(acc.texts.join("\n\n"));
+      const text = clean(acc.final ?? acc.texts.join("\n\n"));
       const ok = code === 0 && !!text && !acc.errors.length;
       if (!ok) return end("failed", code === 0 ? (text ? "the agent reported errors" : "empty reply") : `opencode exited ${code}`);
       ended = true;
@@ -753,7 +831,7 @@ function runAgent(job, { prompt, directory, files = [], allow_edits = false, age
       clearInterval(idleTimer);
       log.end();
       const footer = s.session
-        ? `\n\n---\nsession: ${s.session} (pass as \`session\` to continue this conversation) · cost $${acc.cost.toFixed(4)} · reasoning ${acc.reasoning} tok`
+        ? `\n\n---\nsession: ${s.session} (pass as \`session\` to continue this conversation) · cost $${acc.cost.toFixed(4)}${claude ? "" : ` · reasoning ${acc.reasoning} tok`}`
         : "";
       // the cap keeps the footer: cut the body, then append it
       resolve(finish(job, "done", cap(text, MAX_REPLY - footer.length, s.log) + footer, true));
@@ -806,7 +884,7 @@ async function handle(msg) {
       result: {
         protocolVersion: params?.protocolVersion || "2025-06-18",
         capabilities: { tools: { listChanged: true } },
-        serverInfo: { name: "opencode-agent", version: "2.1.1" },
+        serverInfo: { name: "opencode-agent", version: "2.2.0" },
       },
     });
   }

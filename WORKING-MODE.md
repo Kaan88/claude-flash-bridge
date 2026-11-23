@@ -7,6 +7,7 @@ most hands-on work goes to cheaper workers.
 | Worker | How | Costs my Claude limit? | Use for |
 |---|---|---|---|
 | DeepSeek Flash | `mcp__opencode__opencode_run` + `opencode_result` | No (separate API, cheap) | Default implementer: well-specified code changes, tests, bug fixes with a known cause, mechanical refactors, docs, bulk reading/summarising, first-pass review |
+| Claude Code worker | `opencode_run` with `model: "claude-code/haiku"` (or sonnet, opus, fable) | Yes (your Claude plan) | Work that needs Claude Code's own tools or Claude-level judgement in the background, in parallel with this session; haiku for cheap bulk reading and summaries |
 | Haiku | subagent with model `haiku` | A little | Fast lookups that need this conversation's context: finding files/symbols, reading logs, quick checks |
 | Sonnet | subagent with model `sonnet` | Moderate | Work Flash failed at after 2 fix rounds, or code that must fit subtle existing patterns (UI/layout, concurrency, unsafe/FFI) |
 | Opus (you) | yourself | Most | Design, ambiguous debugging, splitting work, writing specs, reviewing diffs, final decisions |

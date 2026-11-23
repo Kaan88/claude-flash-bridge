@@ -61,6 +61,20 @@ runs with `--auto`, which approves them. The same holds for any agent whose edit
 freely is refused for read-only jobs (use `model` to pick a model instead). An older install's `deepseek-flash-ro` twin is
 still used while it exists; the installer removes it.
 
+## Claude Code as a worker
+
+`model: "claude-code/fable"` (or `opus`, `sonnet`, `haiku`) runs Claude Code's own CLI (`claude -p`) instead of OpenCode,
+through the same jobs: `opencode_result` (one job or several), `opencode_cancel`, the shared limits, and `session` to continue.
+`effort` takes low, medium, high, xhigh or max.
+
+- It runs on your Claude plan with Claude Code's full toolset and your CLAUDE.md files, but loads no MCP servers
+  (`--strict-mcp-config`), so a worker can't start this bridge again.
+- Read-only jobs run in "don't ask" mode, allowed only to read, search, fetch web pages and run git status/diff/log/show;
+  anything else is denied. Edit jobs run in Claude's `auto` permission mode, where Claude's own safety check approves actions.
+- The calling session's `CLAUDE_*` environment variables are not passed on, so the worker is a separate session.
+- Its session ids are UUIDs (OpenCode's start with `ses_`), so passing `session` alone picks the right worker.
+- `agent` doesn't apply. Set `OPENCODE_CLAUDE=0` to hide these models, or `CLAUDE_EXE` when `claude` isn't found.
+
 ## Install or update in one step
 
 Windows (PowerShell):
@@ -122,6 +136,8 @@ Each session runs its own copy of the server. After changing `server.mjs`: in a 
 | `OPENCODE_IDLE_MS` | 20 min | default limit without any output (`idle_seconds` overrides) |
 | `OPENCODE_MAX_CONCURRENT` | 10 | jobs running at once on this machine, all sessions together |
 | `OPENCODE_LOCAL_CONCURRENT` | 2 | jobs running at once on one local model |
+| `CLAUDE_EXE` | found on PATH or in `~/.local/bin` | Claude Code CLI for `claude-code/*` jobs |
+| `OPENCODE_CLAUDE` | on | `0` hides the `claude-code/*` models |
 | `OPENCODE_MAX_REPLY_CHARS` | 20000 | cap on any reply |
 | `OPENCODE_INCLUDE_FREE` | off | `1` lists OpenCode's own free models too |
 | `OPENCODE_KEEP_OLD_MODELS` | off | `1` lists older versions of each model line too |
