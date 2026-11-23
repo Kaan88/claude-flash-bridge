@@ -376,9 +376,11 @@ function compactIds(ids) {
   return [...groups].map(([base, sfx]) => (sfx.length === 1 ? base + sfx[0] : `${base}{${sfx.join(",")}}`));
 }
 
-function catalogText() {
+// Claude Code shows only the first ~2048 characters of a tool's description, so the description stays short and
+// leads with the named workers; the model catalog and the agent list go in the `model` and `agent` parameters.
+function modelsText() {
   const models = shownModels();
-  if (!models.length) return catalogError ? ` (Model list unavailable: ${catalogError}; pass \`model\` as provider/id anyway.)` : "";
+  if (!models.length) return catalogError ? ` (Model list unavailable: ${catalogError}; pass provider/id anyway.)` : "";
   const byProvider = new Map();
   for (const m of models) {
     if (!byProvider.has(m.provider)) byProvider.set(m.provider, { local: m.local, offline: m.offline, groups: new Map() });
@@ -392,19 +394,13 @@ function catalogText() {
   const lines = [...byProvider].map(
     ([prov, p]) => `${prov}${p.local ? (p.offline ? " (local, OFFLINE at startup)" : " (local)") : ""}: ` + [...p.groups].map(([lvl, ids]) => `[${lvl}] ${compactIds(ids).join(" ")}`).join("; "),
   );
+  return "\nModels (provider/id; {,-fast} = id and id-fast; `effort` must be one of the levels in brackets):\n" + lines.join("\n");
+}
+function agentsText() {
   const agents = (catalog?.agents || [])
     .filter((a) => !a.hidden)
     .map((a) => `${a.name} (${a.mode}, ${a.model}${a.guarded === false ? ", edit jobs only" : ""})${a.description ? `: ${a.description}` : ""}`);
-  return (
-    "\n\nModels for `model` (provider/id; {,-fast} = id and id-fast); `effort` must be one of the model's levels in brackets:\n" +
-    lines.join("\n") +
-    (agents.length ? `\n\nAgents for \`agent\`:\n${agents.join("\n")}` : "") +
-    (CLAUDE_MODELS.length
-      ? `\n\n${CLAUDE_PROVIDER}/* runs Claude Code itself (\`claude -p\`, on your Claude plan) with its full toolset and CLAUDE.md, but no MCP servers; \`agent\` doesn't apply. ` +
-        "Read-only jobs can read, search, fetch web pages and run git status/diff/log/show; edit jobs run in Claude's auto permission mode. Its session ids are UUIDs." +
-        workersText()
-      : "")
-  );
+  return agents.length ? `\nOpenCode agents:\n${agents.join("\n")}` : "";
 }
 
 // The agent a job runs: the one asked for, else the default agent (its read-only twin, where one exists, for read-only jobs).
@@ -418,8 +414,9 @@ function workersText() {
   const list = Object.entries(workers());
   if (!list.length) return "";
   return (
-    "\n\nClaude workers: when the user names one, pass its name as `agent` (no `model` needed; `effort` overrides its default):\n" +
-    list.map(([n, w]) => `${n} (claude-code/${w.model}${w.effort ? `#${w.effort}` : ""}${w.readOnly ? ", read-only" : ""})${w.description ? `: ${w.description}` : ""}`).join("\n")
+    "NAMED WORKERS: when the user names one of these, call this tool with its name as `agent` (no `model` needed; `effort` overrides its default). They run Claude Code itself:\n" +
+    list.map(([n, w]) => `${n} (${w.model}${w.effort ? ` ${w.effort}` : ""}${w.readOnly ? ", read-only" : ""})${w.description ? `: ${w.description.slice(0, 90)}` : ""}`).join("\n") +
+    "\n\n"
   );
 }
 
@@ -487,12 +484,13 @@ async function validate(args) {
 const buildTool = () => ({
   name: "opencode_run",
   description:
-    "Start a task on an OpenCode agent (default DeepSeek Flash; any model below via `model`). Returns AT ONCE with a job id; get the answer (plus its session id) with `opencode_result`. To run several, start them all, then wait for them together by passing every id as `jobs`. " +
-    "A new session starts with NO context: put everything it needs in `prompt` (paths, goal, constraints, expected output format). " +
-    "Pass `session` to continue an earlier conversation (fix rounds, follow-ups) without resending context. " +
-    `At most ${MAX_CONCURRENT} jobs run at once on this machine (all sessions together) and ${LOCAL_CONCURRENT} per local model; extra jobs queue. Without \`allow_edits\` the agent cannot edit files (enforced by OpenCode permissions), whatever the model. ` +
-    `A job is stopped after \`timeout_seconds\` (default ${TIMEOUT_MS / 1000}) or after \`idle_seconds\` without any output (default ${IDLE_MS / 1000}).` +
-    catalogText(),
+    workersText() +
+    "Runs a task in the background on another model and returns AT ONCE with a job id; get the answer (and its session id) with `opencode_result`. To run several, start them all, then pass every id to `opencode_result` as `jobs`. " +
+    "Models: OpenCode's (default DeepSeek Flash; any other via `model`, listed in its description), or Claude Code itself via `model` claude-code/fable, opus, sonnet or haiku (" +
+    "your Claude plan, Claude Code's tools and CLAUDE.md, no MCP servers). " +
+    "A new session starts with NO context: put everything it needs in `prompt` (paths, goal, constraints, output format). Pass `session` to continue an earlier one instead. " +
+    "Without `allow_edits` the job is read-only (enforced, not just asked): it can read, search and run read-only commands. " +
+    `At most ${MAX_CONCURRENT} jobs run at once on this machine and ${LOCAL_CONCURRENT} per local model; more queue. A job stops after \`timeout_seconds\` (default ${TIMEOUT_MS / 1000}) or \`idle_seconds\` without output (default ${IDLE_MS / 1000}).`,
   inputSchema: {
     type: "object",
     properties: {
@@ -517,7 +515,9 @@ const buildTool = () => ({
       },
       model: {
         type: "string",
-        description: `provider/id from the list below. Default: the agent's own model (${MODEL}#high for ${DEFAULT_AGENT}). Runs with the chosen agent's tools and permissions.`,
+        description:
+          `provider/id. Default: the agent's own model (${MODEL}#high for ${DEFAULT_AGENT}). claude-code/fable, opus, sonnet or haiku run Claude Code itself (efforts low-max; edit jobs in its auto permission mode).` +
+          modelsText(),
       },
       effort: {
         type: "string",
@@ -533,7 +533,12 @@ const buildTool = () => ({
         type: "number",
         description: `Stop the job when OpenCode prints nothing for this long. Default ${IDLE_MS / 1000}, at most the wall-clock limit.`,
       },
-      agent: { type: "string", description: `OpenCode agent (list below) for its own instructions and permissions. Default ${DEFAULT_AGENT}. To pick a model, use \`model\`, not an agent.` },
+      agent: {
+        type: "string",
+        description:
+          `A named worker (listed in the tool description), or an OpenCode agent for its own instructions and permissions. Default ${DEFAULT_AGENT}. To pick a model, use \`model\`, not an agent.` +
+          agentsText(),
+      },
     },
     required: ["prompt"],
   },
@@ -938,7 +943,7 @@ async function handle(msg) {
       result: {
         protocolVersion: params?.protocolVersion || "2025-06-18",
         capabilities: { tools: { listChanged: true } },
-        serverInfo: { name: "opencode-agent", version: "2.3.0" },
+        serverInfo: { name: "opencode-agent", version: "2.3.1" },
       },
     });
   }
