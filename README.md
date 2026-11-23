@@ -34,7 +34,7 @@ the server sends `tools/list_changed` and Claude re-reads it. An unknown model t
 Passing `effort` without `model` now applies it to the chosen agent's own model (it used to always apply to `OPENCODE_MODEL`).
 
 The call returns at once so that a long job can never hit a tool-call timeout (it used to, and lost the reply
-while the edits landed anyway). At most 3 jobs run at a time per server (`OPENCODE_MAX_CONCURRENT`); further ones queue.
+while the edits landed anyway). At most 10 jobs run at a time per server (`OPENCODE_MAX_CONCURRENT`); further ones queue.
 
 **Limits.** A job is stopped after `timeout_seconds` (default `OPENCODE_TIMEOUT_MS`, 60 min, max 4 h) or when
 OpenCode prints nothing for `idle_seconds` (default `OPENCODE_IDLE_MS`, 20 min: one silent build or test run can
@@ -114,7 +114,7 @@ Each session runs its own copy of the server. After changing `server.mjs`: in a 
 | `OPENCODE_MODEL` | `deepseek/deepseek-flash` | model used for the `effort` variants |
 | `OPENCODE_TIMEOUT_MS` | 60 min | default wall-clock limit per job; normally left unset (pass `timeout_seconds` per job instead, max 4 h) |
 | `OPENCODE_IDLE_MS` | 20 min | default limit without any output (`idle_seconds` overrides) |
-| `OPENCODE_MAX_CONCURRENT` | 3 | jobs running at once per server |
+| `OPENCODE_MAX_CONCURRENT` | 10 | jobs running at once per server |
 | `OPENCODE_MAX_REPLY_CHARS` | 20000 | cap on any reply |
 | `OPENCODE_INCLUDE_FREE` | off | `1` lists OpenCode's own free models too |
 | `OPENCODE_KEEP_OLD_MODELS` | off | `1` lists older versions of each model line too |

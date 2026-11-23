@@ -40,7 +40,7 @@ const MIN = 60 * 1000;
 const TIMEOUT_MS = Number(process.env.OPENCODE_TIMEOUT_MS || 60 * MIN);
 const IDLE_MS = Number(process.env.OPENCODE_IDLE_MS || 20 * MIN);
 const MAX_TIMEOUT_MS = 4 * 60 * MIN;
-const MAX_CONCURRENT = Math.max(1, Number(process.env.OPENCODE_MAX_CONCURRENT || 3));
+const MAX_CONCURRENT = Math.max(1, Number(process.env.OPENCODE_MAX_CONCURRENT || 10));
 const MAX_REPLY = Number(process.env.OPENCODE_MAX_REPLY_CHARS || 20000);
 const LAST_TEXT = 2000;
 const KEEP_MS = 24 * 60 * MIN;
@@ -698,7 +698,7 @@ async function handle(msg) {
       result: {
         protocolVersion: params?.protocolVersion || "2025-06-18",
         capabilities: { tools: { listChanged: true } },
-        serverInfo: { name: "opencode-agent", version: "1.3.0" },
+        serverInfo: { name: "opencode-agent", version: "1.3.1" },
       },
     });
   }
