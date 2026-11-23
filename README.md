@@ -75,6 +75,21 @@ through the same jobs: `opencode_result` (one job or several), `opencode_cancel`
 - Its session ids are UUIDs (OpenCode's start with `ses_`), so passing `session` alone picks the right worker.
 - `agent` doesn't apply. Set `OPENCODE_CLAUDE=0` to hide these models, or `CLAUDE_EXE` when `claude` isn't found.
 
+### Named workers
+
+Define workers in `~/.claude/claude-workers.json` (or `CLAUDE_WORKERS_FILE`), most easily on OpenCode Config Studio's
+**Claude workers** page:
+
+```json
+{ "workers": { "cc-reviewer": { "model": "opus", "effort": "high", "readOnly": true,
+  "description": "Reviews code for correctness bugs.", "instructions": "Report correctness bugs only, file:line first." } } }
+```
+
+They're listed in the tool description by name, so "ask cc-reviewer to check src/" is enough: Claude passes the name as
+`agent`. `model` is fable, opus, sonnet or haiku; `effort` is the default (a job may override it); `readOnly` workers are
+refused for edit jobs; `instructions` are appended to the worker's system prompt; `disabled: true` hides one. The bridge
+re-reads the file when it changes and tells Claude to refresh its tool list, so no restart is needed.
+
 ## Install or update in one step
 
 Windows (PowerShell):

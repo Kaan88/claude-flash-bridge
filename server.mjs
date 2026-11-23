@@ -12,7 +12,7 @@
 // into the tool description; Claude is told (tools/list_changed) when a refresh changes them.
 import { execFile, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import { createWriteStream, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { createWriteStream, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, statSync, unlinkSync, watchFile, writeFileSync } from "node:fs";
 import { createInterface } from "node:readline";
 import { homedir, tmpdir } from "node:os";
 import { delimiter, isAbsolute, join } from "node:path";
@@ -48,7 +48,40 @@ const CLAUDE_MODELS = CLAUDE_EXE
   : [];
 // Claude sessions are UUIDs, OpenCode's start with "ses_": a session alone says which worker continues it.
 const CLAUDE_SESSION = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-const isClaudeJob = (a) => String(a.model || "").startsWith(`${CLAUDE_PROVIDER}/`) || CLAUDE_SESSION.test(String(a.session || ""));
+// Named Claude Code workers (OpenCode Config Studio's "Claude workers" page), picked with `agent: "<name>"`:
+// { "workers": { "cc-reviewer": { "model": "sonnet", "effort": "high", "readOnly": true, "description": "…", "instructions": "…" } } }
+const WORKERS_FILE = process.env.CLAUDE_WORKERS_FILE || join(homedir(), ".claude", "claude-workers.json");
+let workersCache = { mtime: -1, list: {} };
+function workers() {
+  if (!CLAUDE_EXE) return {};
+  let mtime = 0;
+  try {
+    mtime = statSync(WORKERS_FILE).mtimeMs;
+  } catch {
+    return {};
+  }
+  if (mtime !== workersCache.mtime) {
+    let list = {};
+    try {
+      const raw = JSON.parse(readFileSync(WORKERS_FILE, "utf8")).workers || {};
+      for (const [name, w] of Object.entries(raw))
+        if (/^[A-Za-z0-9][\w.-]*$/.test(name) && w && typeof w === "object" && !w.disabled)
+          list[name] = {
+            model: ["fable", "opus", "sonnet", "haiku"].includes(w.model) ? w.model : "sonnet",
+            effort: CLAUDE_EFFORTS.includes(w.effort) ? w.effort : "",
+            readOnly: !!w.readOnly,
+            description: String(w.description || "").slice(0, 200),
+            instructions: String(w.instructions || ""),
+          };
+    } catch {
+      list = workersCache.list; // half-written or invalid: keep the last good list
+    }
+    workersCache = { mtime, list };
+  }
+  return workersCache.list;
+}
+const isClaudeJob = (a) =>
+  String(a.model || "").startsWith(`${CLAUDE_PROVIDER}/`) || CLAUDE_SESSION.test(String(a.session || "")) || !!(a.agent && workers()[a.agent]);
 // What a read-only Claude job may do: read, search, look things up, and run read-only git commands.
 const CLAUDE_READ_TOOLS = ["Read", "Grep", "Glob", "WebFetch", "WebSearch", "Bash(git status*)", "Bash(git diff*)", "Bash(git log*)", "Bash(git show*)"];
 // The host session's CLAUDE_* variables would tie the worker to it (its session id, messaging socket): drop them.
@@ -368,7 +401,8 @@ function catalogText() {
     (agents.length ? `\n\nAgents for \`agent\`:\n${agents.join("\n")}` : "") +
     (CLAUDE_MODELS.length
       ? `\n\n${CLAUDE_PROVIDER}/* runs Claude Code itself (\`claude -p\`, on your Claude plan) with its full toolset and CLAUDE.md, but no MCP servers; \`agent\` doesn't apply. ` +
-        "Read-only jobs can read, search, fetch web pages and run git status/diff/log/show; edit jobs run in Claude's auto permission mode. Its session ids are UUIDs."
+        "Read-only jobs can read, search, fetch web pages and run git status/diff/log/show; edit jobs run in Claude's auto permission mode. Its session ids are UUIDs." +
+        workersText()
       : "")
   );
 }
@@ -380,9 +414,20 @@ function pickAgent(args) {
   return !catalog || catalog.agents.some((a) => a.name === READONLY_AGENT) ? READONLY_AGENT : DEFAULT_AGENT;
 }
 
+function workersText() {
+  const list = Object.entries(workers());
+  if (!list.length) return "";
+  return (
+    "\n\nClaude workers: when the user names one, pass its name as `agent` (no `model` needed; `effort` overrides its default):\n" +
+    list.map(([n, w]) => `${n} (claude-code/${w.model}${w.effort ? `#${w.effort}` : ""}${w.readOnly ? ", read-only" : ""})${w.description ? `: ${w.description}` : ""}`).join("\n")
+  );
+}
+
 // The model a job runs on, for checking `effort`: the explicit `model`, else the agent's own model.
 function resolveModel(args) {
   if (args.model) return String(args.model).replace(/#.*$/, "");
+  const w = args.agent && workers()[args.agent];
+  if (w) return `${CLAUDE_PROVIDER}/${w.model}`;
   const name = pickAgent(args);
   const a = catalog?.agents.find((x) => x.name === name);
   if (a) return a.model.replace(/#.*$|\s.*$/, "");
@@ -398,7 +443,9 @@ async function validate(args) {
   }
   if (isClaudeJob(args)) {
     if (!CLAUDE_EXE) return "Claude Code's CLI (claude) was not found; set CLAUDE_EXE";
-    if (args.agent) return "`agent` applies to OpenCode jobs only; a claude-code/* job runs Claude Code itself";
+    const w = args.agent ? workers()[args.agent] : null;
+    if (args.agent && !w) return `"${args.agent}" is an OpenCode agent; a claude-code/* job runs Claude Code itself. Claude workers: ${Object.keys(workers()).join(", ") || "(none defined)"}`;
+    if (w?.readOnly && args.allow_edits) return `worker "${args.agent}" is read-only; run it without allow_edits, or pick another worker`;
     if (args.model && !findModel(args.model)) return `unknown model "${args.model}". Claude Code models: ${CLAUDE_MODELS.map((m) => m.ref).join(", ")}`;
     if (args.effort && !CLAUDE_EFFORTS.includes(args.effort)) return `Claude Code effort levels are ${CLAUDE_EFFORTS.join(", ")}`;
     if (args.session && !CLAUDE_SESSION.test(args.session)) return "that session is an OpenCode one; continue it without a claude-code model";
@@ -713,7 +760,13 @@ function absorbClaude(job, acc, ev) {
 function runAgent(job, { prompt, directory, files = [], allow_edits = false, agent, session, effort, model }) {
   return new Promise((resolve) => {
     const s = job.state;
-    const claude = isClaudeJob({ model, session });
+    const claude = isClaudeJob({ model, session, agent });
+    const worker = claude && agent ? workers()[agent] : null;
+    if (worker) {
+      model ||= `${CLAUDE_PROVIDER}/${worker.model}`;
+      effort ||= worker.effort;
+      allow_edits = allow_edits && !worker.readOnly;
+    }
     let exe = OPENCODE_EXE;
     let args;
     if (claude) {
@@ -724,6 +777,7 @@ function runAgent(job, { prompt, directory, files = [], allow_edits = false, age
       if (model) args.push("--model", String(model).slice(CLAUDE_PROVIDER.length + 1));
       if (effort) args.push("--effort", effort);
       if (session) args.push("--resume", session);
+      if (worker?.instructions) args.push("--append-system-prompt", worker.instructions);
       if (!allow_edits) args.push("--allowedTools", ...CLAUDE_READ_TOOLS); // variadic: keep it last
       if (files.length) prompt = `${prompt}\n\nFiles to read first:\n${files.join("\n")}`;
     } else {
@@ -884,7 +938,7 @@ async function handle(msg) {
       result: {
         protocolVersion: params?.protocolVersion || "2025-06-18",
         capabilities: { tools: { listChanged: true } },
-        serverInfo: { name: "opencode-agent", version: "2.2.0" },
+        serverInfo: { name: "opencode-agent", version: "2.3.0" },
       },
     });
   }
@@ -989,6 +1043,10 @@ process.on("SIGTERM", shutdown);
 
 // read the live catalog now; with a cached one, tools/list doesn't wait for it
 refreshCatalog();
+if (CLAUDE_EXE)
+  watchFile(WORKERS_FILE, { interval: 3000, persistent: false }, () => {
+    if (clientReady) send({ jsonrpc: "2.0", method: "notifications/tools/list_changed" });
+  });
 
 createInterface({ input: process.stdin }).on("line", (line) => {
   if (!line.trim()) return;
