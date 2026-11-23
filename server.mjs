@@ -668,8 +668,11 @@ function runAgent(job, { prompt, directory, files = [], allow_edits = false, age
     const log = createWriteStream(s.log);
     let child;
     try {
+      const cwd = directory && existsSync(directory) ? directory : process.cwd();
       child = spawn(OPENCODE_EXE, args, {
-        cwd: directory && existsSync(directory) ? directory : process.cwd(),
+        cwd,
+        // OpenCode takes its working folder from PWD when set, and an inherited PWD is this server's folder
+        env: { ...process.env, PWD: cwd },
         stdio: ["pipe", "pipe", "pipe"],
         windowsHide: true,
         detached: process.platform !== "win32",
@@ -803,7 +806,7 @@ async function handle(msg) {
       result: {
         protocolVersion: params?.protocolVersion || "2025-06-18",
         capabilities: { tools: { listChanged: true } },
-        serverInfo: { name: "opencode-agent", version: "2.1.0" },
+        serverInfo: { name: "opencode-agent", version: "2.1.1" },
       },
     });
   }
