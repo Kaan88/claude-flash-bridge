@@ -86,27 +86,24 @@ const ocDir = join(homedir(), ".config", "opencode");
 const ocConfig =
   ["opencode.json", "opencode.jsonc"].map((f) => join(ocDir, f)).find(existsSync) ||
   (mkdirSync(ocDir, { recursive: true }), writeFileSync(join(ocDir, "opencode.json"), '{ "$schema": "https://opencode.ai/config.json" }\n'), join(ocDir, "opencode.json"));
+// One agent for every job. Its edits and shell commands are "ask": a read-only job runs without --auto, so
+// OpenCode rejects them; an edit job runs with --auto, which approves them. Read-only commands are always allowed.
 editJson(ocConfig, (c) => {
   c.agents ??= {};
+  const { permissions: _old, ...kept } = c.agents["deepseek-flash"] || {};
   c.agents["deepseek-flash"] = {
-    ...(c.agents["deepseek-flash"] || {}),
-    description: "Delegates work to DeepSeek Flash with high reasoning effort.",
-    mode: "subagent",
-    model,
-    permissions: [{ action: "subagent", resource: "*", effect: "deny" }],
-  };
-  c.agents["deepseek-flash-ro"] = {
-    description: "DeepSeek Flash, read-only: cannot edit files or launch subagents.",
-    mode: "subagent",
-    hidden: true,
-    model,
+    ...kept,
+    description: "Delegates work to DeepSeek Flash with high reasoning effort. Asks before edits and shell commands.",
+    mode: kept.mode || "subagent",
+    model: kept.model || model,
     permissions: [
       { action: "subagent", resource: "*", effect: "deny" },
-      { action: "edit", resource: "*", effect: "deny" },
-      { action: "shell", resource: "*", effect: "deny" },
+      { action: "edit", resource: "*", effect: "ask" },
+      { action: "shell", resource: "*", effect: "ask" },
       ...["git status*", "git diff*", "git log*", "git show*", "cargo check*", "cargo clippy*", "cargo test*"].map(shell),
     ],
   };
+  delete c.agents["deepseek-flash-ro"]; // the old read-only twin, no longer needed
 });
 
 // 2. Claude Code CLI, user scope
@@ -148,7 +145,7 @@ editJson(settings, (c) => {
 // 4. Smoke test through OpenCode
 try {
   if (!opencode) throw new Error("OpenCode executable not found");
-  const out = execSync(`"${opencode}" run --agent deepseek-flash-ro --archived "Reply with exactly: PONG"`, {
+  const out = execSync(`"${opencode}" run --agent deepseek-flash --archived "Reply with exactly: PONG"`, {
     encoding: "utf8",
     timeout: 120000,
     cwd: homedir(),

@@ -54,8 +54,12 @@ copies never hand out the same one. If the server that ran a job exits, the job 
 session and edited files) instead of "unknown"; when a session closes, its server stops its running jobs.
 Finished jobs are kept in memory for 24 hours, and their files stay in the state folder.
 
-Without `allow_edits` the job runs the read-only agent `deepseek-flash-ro`, which can't edit files (OpenCode
-permissions), but can still read files and run commands such as tests.
+The `deepseek-flash` agent's edits and shell commands are set to **ask**. Without `allow_edits` a job runs without
+`--auto`, and OpenCode rejects every ask when nobody can answer it, so the agent can read files and run the allowed
+read-only commands (git status/diff/log/show, cargo check/clippy/test) but can't change anything. With `allow_edits` the job
+runs with `--auto`, which approves them. The same holds for any agent whose edits are "ask" or "deny"; an agent that edits
+freely is refused for read-only jobs (use `model` to pick a model instead). An older install's `deepseek-flash-ro` twin is
+still used while it exists; the installer removes it.
 
 ## Install or update in one step
 
@@ -94,7 +98,7 @@ Needs Node 18+, OpenCode, and Claude Code and/or Claude Desktop.
    OpenCode's own store, never in this repo).
 2. Clone this repo to `~/.claude/mcp-servers/opencode-agent`.
 3. Run `node install.mjs` in that folder. It:
-   - adds the `deepseek-flash` and `deepseek-flash-ro` agents to `~/.config/opencode/opencode.json`,
+   - adds the `deepseek-flash` agent (asks before edits and shell commands) to `~/.config/opencode/opencode.json` and removes the old `deepseek-flash-ro`,
    - registers the server in Claude Code (user scope) without time-limit settings, so every client uses the server's own defaults (it sets `OPENCODE_EXE` only when OpenCode isn't on PATH),
    - adds it to Claude Desktop's `claude_desktop_config.json`,
    - sets `MCP_TOOL_TIMEOUT=1800000` in `~/.claude/settings.json` (a safety net),

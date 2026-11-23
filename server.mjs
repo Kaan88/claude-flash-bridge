@@ -31,7 +31,9 @@ function findOpencode() {
 }
 const OPENCODE_EXE = findOpencode();
 const DEFAULT_AGENT = process.env.OPENCODE_AGENT || "deepseek-flash";
-// Read-only twin of the default agent: OpenCode denies its edit tools (see opencode.json).
+// Read-only jobs run without --auto, so an agent whose edits and shell commands are "ask" can't change anything:
+// OpenCode rejects every ask when nobody can answer. Such an agent serves both kinds of job. An older install's
+// separate read-only twin (<agent>-ro, edits denied) is still used when it exists.
 const READONLY_AGENT = process.env.OPENCODE_READONLY_AGENT || `${DEFAULT_AGENT}-ro`;
 const MODEL = process.env.OPENCODE_MODEL || "deepseek/deepseek-flash";
 const MIN = 60 * 1000;
@@ -198,6 +200,11 @@ async function fetchCatalog() {
   );
   for (const [ref, b] of bases) all.get(ref).offline = !up.get(b);
   // what an agent runs on: its own model and variant, else OpenCode's default model
+  // can this agent change files when nothing approves its asks? (the last matching rule wins)
+  const guarded = (a) => {
+    const rules = (a.permissions || a.permission || []).filter((r) => (r.action === "edit" || r.action === "*") && r.resource === "*");
+    return rules.length ? rules.at(-1).effect !== "allow" : false;
+  };
   const agentModel = (a) => (a.model?.id ? `${a.model.providerID}/${a.model.id}${a.model.variant ? `#${a.model.variant}` : ""}` : def ? `${refOf(def)} (default)` : "default model");
   return {
     at: Date.now(),
@@ -205,7 +212,7 @@ async function fetchCatalog() {
     models: [...all.values()],
     agents: agents
       .filter((a) => !a.hidden || a.id === READONLY_AGENT)
-      .map((a) => ({ name: a.id, hidden: !!a.hidden, mode: a.mode, model: agentModel(a), description: (a.description || "").split(/(?<=\.)\s/)[0].slice(0, 90) })),
+      .map((a) => ({ name: a.id, hidden: !!a.hidden, mode: a.mode, guarded: guarded(a), model: agentModel(a), description: (a.description || "").split(/(?<=\.)\s/)[0].slice(0, 90) })),
     defaultModel: def ? refOf(def) : null,
   };
 }
@@ -324,7 +331,9 @@ function catalogText() {
   const lines = [...byProvider].map(
     ([prov, p]) => `${prov}${p.local ? (p.offline ? " (local, OFFLINE at startup)" : " (local)") : ""}: ` + [...p.groups].map(([lvl, ids]) => `[${lvl}] ${compactIds(ids).join(" ")}`).join("; "),
   );
-  const agents = (catalog?.agents || []).filter((a) => !a.hidden).map((a) => `${a.name} (${a.mode}, ${a.model})${a.description ? `: ${a.description}` : ""}`);
+  const agents = (catalog?.agents || [])
+    .filter((a) => !a.hidden)
+    .map((a) => `${a.name} (${a.mode}, ${a.model}${a.guarded === false ? ", edit jobs only" : ""})${a.description ? `: ${a.description}` : ""}`);
   return (
     "\n\nModels for `model` (provider/id; {,-fast} = id and id-fast); `effort` must be one of the model's levels in brackets:\n" +
     lines.join("\n") +
@@ -332,10 +341,17 @@ function catalogText() {
   );
 }
 
+// The agent a job runs: the one asked for, else the default agent (its read-only twin, where one exists, for read-only jobs).
+function pickAgent(args) {
+  if (args.agent) return args.agent;
+  if (args.allow_edits) return DEFAULT_AGENT;
+  return !catalog || catalog.agents.some((a) => a.name === READONLY_AGENT) ? READONLY_AGENT : DEFAULT_AGENT;
+}
+
 // The model a job runs on, for checking `effort`: the explicit `model`, else the agent's own model.
 function resolveModel(args) {
   if (args.model) return String(args.model).replace(/#.*$/, "");
-  const name = args.agent || (args.allow_edits ? DEFAULT_AGENT : READONLY_AGENT);
+  const name = pickAgent(args);
   const a = catalog?.agents.find((x) => x.name === name);
   if (a) return a.model.replace(/#.*$|\s.*$/, "");
   return name === DEFAULT_AGENT || name === READONLY_AGENT ? MODEL : catalog?.defaultModel || MODEL;
@@ -352,6 +368,9 @@ async function validate(args) {
   if (!catalog) return ""; // no catalog: let OpenCode judge
   const check = () => {
     if (args.agent && !catalog.agents.some((a) => a.name === args.agent)) return `unknown agent "${args.agent}". Agents: ${catalog.agents.filter((a) => !a.hidden).map((a) => a.name).join(", ")}`;
+    const info = catalog.agents.find((a) => a.name === pickAgent(args));
+    if (!args.allow_edits && info?.guarded === false)
+      return `agent "${info.name}" can edit files and run commands without asking, so it can't run a read-only job. Pass allow_edits: true, or leave \`agent\` out and choose the model with \`model\` instead.`;
     const ref = resolveModel(args);
     const m = findModel(ref);
     if (args.model && !m) {
@@ -427,7 +446,7 @@ const buildTool = () => ({
         type: "number",
         description: `Stop the job when OpenCode prints nothing for this long. Default ${IDLE_MS / 1000}, at most the wall-clock limit.`,
       },
-      agent: { type: "string", description: `OpenCode agent (list below) for a new session. Default ${DEFAULT_AGENT}, or ${READONLY_AGENT} without allow_edits.` },
+      agent: { type: "string", description: `OpenCode agent (list below) for its own instructions and permissions. Default ${DEFAULT_AGENT}. To pick a model, use \`model\`, not an agent.` },
     },
     required: ["prompt"],
   },
@@ -635,7 +654,7 @@ function runAgent(job, { prompt, directory, files = [], allow_edits = false, age
     if (isAbsolute(OPENCODE_EXE) && !existsSync(OPENCODE_EXE)) {
       return resolve(finish(job, "failed", `opencode executable not found: ${OPENCODE_EXE} (set OPENCODE_EXE)`));
     }
-    const chosen = agent || (allow_edits ? DEFAULT_AGENT : READONLY_AGENT);
+    const chosen = pickAgent({ agent, allow_edits });
     const args = ["run", "--format", "json", "--archived", "--agent", chosen];
     if (session) args.push("--session", session);
     else args.push("--title", "claude-delegate");
@@ -784,7 +803,7 @@ async function handle(msg) {
       result: {
         protocolVersion: params?.protocolVersion || "2025-06-18",
         capabilities: { tools: { listChanged: true } },
-        serverInfo: { name: "opencode-agent", version: "2.0.0" },
+        serverInfo: { name: "opencode-agent", version: "2.1.0" },
       },
     });
   }
