@@ -6,7 +6,7 @@ most hands-on work goes to cheaper workers.
 ### Workers
 | Worker | How | Costs my Claude limit? | Use for |
 |---|---|---|---|
-| DeepSeek Flash | `mcp__deepseek-flash__deepseek_flash` + `deepseek_flash_result` | No (separate API, cheap) | Default implementer: well-specified code changes, tests, bug fixes with a known cause, mechanical refactors, docs, bulk reading/summarising, first-pass review |
+| DeepSeek Flash | `mcp__opencode__opencode_run` + `opencode_result` | No (separate API, cheap) | Default implementer: well-specified code changes, tests, bug fixes with a known cause, mechanical refactors, docs, bulk reading/summarising, first-pass review |
 | Haiku | subagent with model `haiku` | A little | Fast lookups that need this conversation's context: finding files/symbols, reading logs, quick checks |
 | Sonnet | subagent with model `sonnet` | Moderate | Work Flash failed at after 2 fix rounds, or code that must fit subtle existing patterns (UI/layout, concurrency, unsafe/FFI) |
 | Opus (you) | yourself | Most | Design, ambiguous debugging, splitting work, writing specs, reviewing diffs, final decisions |
@@ -35,11 +35,11 @@ a level the model lacks is refused with the valid ones.
 OpenCode's free models left out, local ones marked) as `provider/id`; pass one only when a task needs a
 stronger or different model than Flash. It runs with the same agent and the same read-only rule.
 
-`deepseek_flash` returns at once with a job id; it does not wait for the work. Get the reply with
-`deepseek_flash_result { job }`, which waits up to ~55 s per call and says "still running" until the job is done.
+`opencode_run` returns at once with a job id; it does not wait for the work. Get the reply with
+`opencode_result { job }` (or `{ jobs: [...] }` for several, returning whichever finishes first), which waits up to ~55 s per call and says "still running" until the job is done.
 Start parallel jobs first, then collect their results; don't redo or re-send a job that is still running, and
 don't start a second job on the same files while one may still be editing them. A job that runs long builds or
-test suites gets a larger `timeout_seconds`; `deepseek_flash_cancel { job }` stops one that went wrong. A
+test suites gets a larger `timeout_seconds`; `opencode_cancel { job }` stops one that went wrong. A
 timed-out, cancelled or lost job returns a short summary (session, files edited, last text, log path): review
 whatever it left in `git diff`, or continue its session to finish.
 

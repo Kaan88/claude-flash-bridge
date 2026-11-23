@@ -1,4 +1,4 @@
-# One-step setup and update of the deepseek-flash bridge on Windows:
+# One-step setup and update of the OpenCode bridge on Windows:
 #   irm https://raw.githubusercontent.com/Kaan88/claude-flash-bridge/main/setup.ps1 | iex
 # Installs only what is missing: Node.js, Git, Claude Code, OpenCode and this bridge. A bridge already installed
 # is used where it is (the copy Claude is registered with, else ~/.claude/mcp-servers/opencode-agent; a git clone
@@ -71,7 +71,7 @@ const desktop = process.platform === "win32" ? p.join(process.env.APPDATA || "",
   : p.join(os.homedir(), ".config", "Claude", "claude_desktop_config.json");
 for (const f of [p.join(os.homedir(), ".claude.json"), desktop]) {
   try {
-    const s = (JSON.parse(fs.readFileSync(f, "utf8")).mcpServers || {})["deepseek-flash"];
+    const m = JSON.parse(fs.readFileSync(f, "utf8")).mcpServers || {}, s = m.opencode || m["deepseek-flash"];
     const server = ((s && s.args) || []).find((a) => /server\.mjs$/.test(a));
     if (server && fs.existsSync(server)) { console.log(p.dirname(server)); break; }
   } catch {}

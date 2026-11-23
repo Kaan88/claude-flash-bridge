@@ -12,7 +12,7 @@
 // into the tool description; Claude is told (tools/list_changed) when a refresh changes them.
 import { execFile, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import { createWriteStream, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { createWriteStream, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { createInterface } from "node:readline";
 import { tmpdir } from "node:os";
 import { delimiter, isAbsolute, join } from "node:path";
@@ -47,18 +47,99 @@ const KEEP_MS = 24 * 60 * MIN;
 const STATE_DIR = process.env.OPENCODE_STATE_DIR || join(tmpdir(), "opencode-agent");
 mkdirSync(STATE_DIR, { recursive: true });
 
-let running = 0;
-const queue = [];
-async function limited(fn) {
-  if (running >= MAX_CONCURRENT) await new Promise((r) => queue.push(r));
-  running++;
+// ---- job slots, shared by every server instance on this machine ----
+// OPENCODE_MAX_CONCURRENT jobs run at once machine-wide (all Claude sessions together), and at most
+// OPENCODE_LOCAL_CONCURRENT at once on any one local model, which a local server mostly runs one request at a time.
+// A slot is a file created exclusively in <state>/slots; a slot whose owner process has exited is free again.
+const LOCAL_CONCURRENT = Math.max(1, Number(process.env.OPENCODE_LOCAL_CONCURRENT || 2));
+const SLOT_DIR = join(STATE_DIR, "slots");
+mkdirSync(SLOT_DIR, { recursive: true });
+const held = new Set();
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+function slotOwner(path) {
   try {
-    return await fn();
-  } finally {
-    running--;
-    queue.shift()?.();
+    return JSON.parse(readFileSync(path, "utf8")).pid;
+  } catch {
+    return null; // being written, or just released
   }
 }
+function tryTake(pool, size, jobId) {
+  for (let i = 0; i < size; i++) {
+    const path = join(SLOT_DIR, `${pool}.${i}`);
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        writeFileSync(path, JSON.stringify({ pid: process.pid, job: jobId }), { flag: "wx" });
+        held.add(path);
+        return path;
+      } catch (e) {
+        if (e.code !== "EEXIST") break;
+        const owner = slotOwner(path);
+        if (owner === null || alive(owner)) break;
+        try {
+          unlinkSync(path); // left behind by a server that exited
+        } catch {
+          break;
+        }
+      }
+    }
+  }
+  return null;
+}
+function release(path) {
+  if (!path) return;
+  held.delete(path);
+  try {
+    unlinkSync(path);
+  } catch {
+    // already gone
+  }
+}
+// slots of a pool currently held by a live server
+function inUse(pool) {
+  try {
+    return readdirSync(SLOT_DIR).filter((f) => f.startsWith(`${pool}.`) && alive(slotOwner(join(SLOT_DIR, f)))).length;
+  } catch {
+    return 0;
+  }
+}
+const localPool = (ref) => `local-${createHash("sha1").update(ref.toLowerCase()).digest("hex").slice(0, 12)}`;
+
+// Waits for a machine-wide slot (and a slot on its local model, if any), then runs fn.
+async function limited(job, local, fn) {
+  let all = null, own = null;
+  try {
+    while (!job.cancelled) {
+      own = local ? tryTake(local, LOCAL_CONCURRENT, job.state.id) : null;
+      if (!local || own) {
+        all = tryTake("all", MAX_CONCURRENT, job.state.id);
+        if (all) break;
+        release(own);
+        own = null;
+      }
+      const why = local && !own ? `waiting: ${LOCAL_CONCURRENT} job(s) already on this local model` : `waiting: ${MAX_CONCURRENT} jobs already running on this machine`;
+      if (job.state.waiting !== why) {
+        job.state.waiting = why;
+        saveState(job.state);
+      }
+      await sleep(1000);
+    }
+    job.state.waiting = "";
+    return await fn();
+  } finally {
+    release(all);
+    release(own);
+  }
+}
+process.on("exit", () => {
+  for (const p of held) {
+    try {
+      unlinkSync(p);
+    } catch {
+      // ignore
+    }
+  }
+});
 
 // ---- model and agent catalog, read live from OpenCode ----
 
@@ -298,12 +379,12 @@ async function validate(args) {
 }
 
 const buildTool = () => ({
-  name: "deepseek_flash",
+  name: "opencode_run",
   description:
-    "Start a task on an OpenCode agent (default DeepSeek Flash; any model below via `model`). Returns AT ONCE with a job id; get the answer (plus its session id) with `deepseek_flash_result`. " +
+    "Start a task on an OpenCode agent (default DeepSeek Flash; any model below via `model`). Returns AT ONCE with a job id; get the answer (plus its session id) with `opencode_result`. To run several, start them all, then wait for them together by passing every id as `jobs`. " +
     "A new session starts with NO context: put everything it needs in `prompt` (paths, goal, constraints, expected output format). " +
     "Pass `session` to continue an earlier conversation (fix rounds, follow-ups) without resending context. " +
-    `At most ${MAX_CONCURRENT} calls run at once per server; extra calls wait. Without \`allow_edits\` the agent cannot edit files (enforced by OpenCode permissions), whatever the model. ` +
+    `At most ${MAX_CONCURRENT} jobs run at once on this machine (all sessions together) and ${LOCAL_CONCURRENT} per local model; extra jobs queue. Without \`allow_edits\` the agent cannot edit files (enforced by OpenCode permissions), whatever the model. ` +
     `A job is stopped after \`timeout_seconds\` (default ${TIMEOUT_MS / 1000}) or after \`idle_seconds\` without any output (default ${IDLE_MS / 1000}).` +
     catalogText(),
   inputSchema: {
@@ -360,23 +441,24 @@ function effortEnum() {
 }
 
 const RESULT_TOOL = {
-  name: "deepseek_flash_result",
+  name: "opencode_result",
   description:
-    "Get the answer of a job started with `deepseek_flash`. Returns the reply and session id when done, or a one-line progress report while running. " +
-    "A timed-out, cancelled or failed job returns a short summary (session, files touched, last text, log path), never the raw log. " +
-    "`wait_seconds` (default 50, max 55) waits up to that long for it to finish before answering.",
+    "Get the answers of jobs started with `opencode_run`. Pass one `job`, or several as `jobs`: it waits until ANY of them finishes (up to `wait_seconds`, default 50, max 55), " +
+    "then returns each finished one's reply and session id, and a one-line progress report for each still running. " +
+    "With `jobs`, a reply is returned once: repeat the same call until it says all are done; finished ones then show as one line. " +
+    "A timed-out, cancelled or failed job returns a short summary (session, files touched, last text, log path), never the raw log.",
   inputSchema: {
     type: "object",
     properties: {
-      job: { type: "string", description: "The job id deepseek_flash returned (e.g. job_k3x_2)." },
-      wait_seconds: { type: "number", description: "Wait up to this many seconds for the job to finish. Default 50." },
+      job: { type: "string", description: "A job id opencode_run returned (e.g. job_k3x_2)." },
+      jobs: { type: "array", items: { type: "string" }, description: "Several job ids: wait for whichever finishes first." },
+      wait_seconds: { type: "number", description: "Wait up to this many seconds for a job to finish. Default 50." },
     },
-    required: ["job"],
   },
 };
 
 const CANCEL_TOOL = {
-  name: "deepseek_flash_cancel",
+  name: "opencode_cancel",
   description:
     "Stop a running job and its whole process tree (builds and tests it started included). Edits it already made stay on disk; its session can be continued later.",
   inputSchema: {
@@ -392,6 +474,7 @@ const CANCEL_TOOL = {
 const PREFIX = `job_${process.pid.toString(36)}`;
 let nextJob = 1;
 const jobs = new Map(); // this instance's jobs: id -> { state, promise, child, cancel }
+const delivered = new Set(); // jobs whose reply a multi-job result call already returned
 
 const statePath = (id) => join(STATE_DIR, `${id}.json`);
 const logPath = (id) => join(STATE_DIR, `${id}.jsonl`);
@@ -450,7 +533,10 @@ function startJob(args) {
     log: logPath(id),
   };
   const job = { state, child: null, cancelled: false };
-  job.promise = limited(() => (job.cancelled ? finish(job, "cancelled", "cancelled before it started") : runAgent(job, args)));
+  const ref = resolveModel(args);
+  const local = findModel(ref)?.local ? localPool(ref) : null;
+  state.model = ref;
+  job.promise = limited(job, local, () => (job.cancelled ? finish(job, "cancelled", "cancelled before it started") : runAgent(job, args)));
   jobs.set(id, job);
   saveState(state);
   prune();
@@ -590,7 +676,7 @@ function runAgent(job, { prompt, directory, files = [], allow_edits = false, age
       log.end();
       resolve(finish(job, status, summary(job, acc, status, reason)));
     };
-    job.cancel = () => end("cancelled", "stopped by deepseek_flash_cancel");
+    job.cancel = () => end("cancelled", "stopped by opencode_cancel");
 
     const wallTimer = setTimeout(() => end("timeout", `wall-clock limit ${s.timeoutMs / 1000}s`), s.timeoutMs);
     // once a second: write changed progress for other instances, and check the idle limit
@@ -679,7 +765,7 @@ function current(id) {
 
 function progress(s) {
   const now = Date.now();
-  const since = s.status === "queued" ? "queued" : `running ${Math.round((now - (s.running || s.started)) / 1000)}s`;
+  const since = s.status === "queued" ? `queued${s.waiting ? ` (${s.waiting})` : ""}` : `running ${Math.round((now - (s.running || s.started)) / 1000)}s`;
   const quiet = s.lastEvent ? `, last output ${Math.round((now - s.lastEvent) / 1000)}s ago` : "";
   const tool = s.lastTool ? `, last tool ${s.lastTool}` : "";
   const files = s.files?.length ? `, ${s.files.length} file(s) edited` : "";
@@ -698,7 +784,7 @@ async function handle(msg) {
       result: {
         protocolVersion: params?.protocolVersion || "2025-06-18",
         capabilities: { tools: { listChanged: true } },
-        serverInfo: { name: "opencode-agent", version: "1.3.1" },
+        serverInfo: { name: "opencode-agent", version: "2.0.0" },
       },
     });
   }
@@ -714,37 +800,54 @@ async function handle(msg) {
   if (method === "tools/call") {
     const reply = (text, isError = false) => send({ jsonrpc: "2.0", id, result: { content: [{ type: "text", text }], isError } });
     const a = params?.arguments || {};
-    if (params?.name === "deepseek_flash") {
+    if (params?.name === "opencode_run") {
       if (!a.prompt) return reply("prompt is required", true);
       const bad = await validate(a);
       if (bad) return reply(bad, true);
-      const waiting = running >= MAX_CONCURRENT ? ` (queued: ${MAX_CONCURRENT} jobs already running)` : "";
+      const waiting = inUse("all") >= MAX_CONCURRENT ? ` (queued: ${MAX_CONCURRENT} jobs already running on this machine)` : "";
       const job = startJob(a);
       const s = jobs.get(job).state;
       const on = a.model || a.effort ? ` on ${a.model || resolveModel(a)}${a.effort ? `#${a.effort}` : ""}` : "";
-      return reply(`started ${job}${on}${waiting}, limit ${s.timeoutMs / 1000}s, idle ${s.idleMs / 1000}s. Get the answer with deepseek_flash_result { job: "${job}" }.`);
+      return reply(`started ${job}${on}${waiting}, limit ${s.timeoutMs / 1000}s, idle ${s.idleMs / 1000}s. Get the answer with opencode_result { job: "${job}" }, or several ids at once as \`jobs\`.`);
     }
     if (params?.name === RESULT_TOOL.name) {
-      const { job: jid, wait_seconds = 50 } = a;
-      let found = current(jid);
-      if (!found) return reply(`unknown job ${jid} (no state in ${STATE_DIR}; any edits it made are still on disk)`, true);
-      const ms = Math.max(0, Math.min(55, Number(wait_seconds) || 0)) * 1000;
+      const ids = [...new Set([...(Array.isArray(a.jobs) ? a.jobs : []), ...(a.job ? [a.job] : [])].map(String))];
+      if (!ids.length) return reply("pass `job` or `jobs`", true);
       const pending = (s) => s.status === "running" || s.status === "queued";
-      if (pending(found.state) && ms > 0) {
-        if (found.job) await Promise.race([found.job.promise, new Promise((r) => setTimeout(r, ms))]);
-        else {
-          // another instance's job: watch its state file
-          const until = Date.now() + ms;
-          while (Date.now() < until && pending(found.state)) {
-            await new Promise((r) => setTimeout(r, 2000));
-            found = current(jid) || found;
-          }
-        }
-        found = current(jid) || found;
+      const look = () => new Map(ids.map((jid) => [jid, current(jid)]));
+      let found = look();
+      if (ids.every((jid) => !found.get(jid))) return reply(`unknown job${ids.length > 1 ? "s" : ""} ${ids.join(", ")} (no state in ${STATE_DIR}; any edits made are still on disk)`, true);
+      // with several jobs, one already returned is not news
+      const fresh = (jid) => ids.length === 1 || !delivered.has(jid);
+      const ready = () => ids.some((jid) => found.get(jid) && !pending(found.get(jid).state) && fresh(jid));
+      const anyPending = () => ids.some((jid) => found.get(jid) && pending(found.get(jid).state));
+      const until = Date.now() + Math.max(0, Math.min(55, Number(a.wait_seconds ?? 50) || 0)) * 1000;
+      while (!ready() && anyPending() && Date.now() < until) {
+        // only jobs still pending: a settled promise would end the race at once, every time
+        const mine = ids.filter((jid) => found.get(jid) && pending(found.get(jid).state)).map((jid) => found.get(jid).job?.promise).filter(Boolean);
+        await Promise.race([...mine, sleep(Math.min(2000, Math.max(0, until - Date.now())))]);
+        found = look();
       }
-      const s = found.state;
-      if (pending(s)) return reply(progress(s));
-      return reply(s.reply || `${jid} ${s.status}`, !s.ok);
+      if (ids.length === 1) {
+        const s = found.get(ids[0]).state;
+        if (pending(s)) return reply(progress(s));
+        return reply(s.reply || `${ids[0]} ${s.status}`, !s.ok);
+      }
+      const parts = [];
+      const lines = [];
+      for (const jid of ids) {
+        const f = found.get(jid);
+        if (!f) lines.push(`${jid}: unknown`);
+        else if (pending(f.state)) lines.push(progress(f.state));
+        else if (!fresh(jid)) lines.push(`${jid}: ${f.state.status}, reply already returned`);
+        else {
+          delivered.add(jid);
+          parts.push(`## ${jid} · ${f.state.status}\n${f.state.reply || f.state.status}`);
+        }
+      }
+      const left = ids.filter((jid) => found.get(jid) && pending(found.get(jid).state)).length;
+      lines.push(left ? `${left} still running: repeat this call to wait for the next.` : "All done.");
+      return reply([...parts, lines.join("\n")].join("\n\n"));
     }
     if (params?.name === CANCEL_TOOL.name) {
       const found = current(a.job);

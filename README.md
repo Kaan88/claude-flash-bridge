@@ -1,4 +1,4 @@
-# deepseek-flash bridge for Claude Code
+# OpenCode bridge for Claude Code
 
 A small MCP server (no dependencies, one file) that lets Claude hand work to a DeepSeek Flash agent
 running in [OpenCode](https://opencode.ai). Claude plans and reviews; Flash does the hands-on
@@ -8,14 +8,14 @@ coding on DeepSeek's API, which doesn't count against your Claude usage limits.
 
 | Tool | What it does |
 |---|---|
-| `deepseek_flash` | Starts a Flash job and returns **at once** with a job id (`job_k3x_2`). Inputs: `prompt`, `directory`, `allow_edits`, `session`, `model` (any OpenCode model, `provider/id`), `effort` (that model's own levels), `files`, `agent`, `timeout_seconds`, `idle_seconds`. |
-| `deepseek_flash_result` | `{ job, wait_seconds? }`. Waits up to 55 s, then returns Flash's reply ending in `session: ses_…`, or one progress line while it runs (elapsed time, last output, last tool, files edited). |
-| `deepseek_flash_cancel` | `{ job }`. Stops a running job and its whole process tree (builds and tests included). Edits stay on disk; the session can be continued. |
+| `opencode_run` | Starts a job and returns **at once** with a job id (`job_k3x_2`). Inputs: `prompt`, `directory`, `allow_edits`, `session`, `model` (any OpenCode model, `provider/id`), `effort` (that model's own levels), `files`, `agent`, `timeout_seconds`, `idle_seconds`. |
+| `opencode_result` | `{ job }` or `{ jobs: [...] }`, plus `wait_seconds?`. Waits up to 55 s for the job, or for **any** of the jobs, then returns each finished reply (ending in `session: ses_…`) and one progress line per job still running (elapsed time, last output, last tool, files edited, why it is queued). With `jobs`, each reply is returned once; repeat the call until it says all are done. |
+| `opencode_cancel` | `{ job }`. Stops a running job and its whole process tree (builds and tests included). Edits stay on disk; the session can be continued. |
 
 ### Models, effort levels and agents (read live)
 
 When the server starts it asks OpenCode for its models and agents (`opencode api model.list` / `agent.list`,
-about a third of a second) and writes them into the `deepseek_flash` tool description in a compact form,
+about a third of a second) and writes them into the `opencode_run` tool description in a compact form,
 grouped by provider and effort levels, e.g. `anthropic: [low-max] claude-opus-5-5{,-fast} ...`
 (about 500 tokens for ~30 models; Claude Code loads the schema only when the tool is used). The levels are each model's
 real OpenCode variants, so `effort` is checked per model and a wrong level or unknown model is refused with the valid
@@ -34,7 +34,9 @@ the server sends `tools/list_changed` and Claude re-reads it. An unknown model t
 Passing `effort` without `model` now applies it to the chosen agent's own model (it used to always apply to `OPENCODE_MODEL`).
 
 The call returns at once so that a long job can never hit a tool-call timeout (it used to, and lost the reply
-while the edits landed anyway). At most 10 jobs run at a time per server (`OPENCODE_MAX_CONCURRENT`); further ones queue.
+while the edits landed anyway). At most 10 jobs run at once on the machine, across every Claude session (`OPENCODE_MAX_CONCURRENT`), and at most 2 on any one
+local model (`OPENCODE_LOCAL_CONCURRENT`), since a local server mostly answers one request at a time; further jobs queue.
+The slots are files in `<state folder>/slots`; a slot left by a server that exited is freed automatically.
 
 **Limits.** A job is stopped after `timeout_seconds` (default `OPENCODE_TIMEOUT_MS`, 60 min, max 4 h) or when
 OpenCode prints nothing for `idle_seconds` (default `OPENCODE_IDLE_MS`, 20 min: one silent build or test run can
@@ -102,7 +104,7 @@ Needs Node 18+, OpenCode, and Claude Code and/or Claude Desktop.
 ## Updating sessions that are already open
 
 Each session runs its own copy of the server. After changing `server.mjs`: in a session type `/mcp`, pick
-**deepseek-flash**, then **Reconnect**, or quit and reopen the app (conversations stay).
+**opencode**, then **Reconnect**, or quit and reopen the app (conversations stay).
 
 ## Settings (environment variables)
 
@@ -114,7 +116,8 @@ Each session runs its own copy of the server. After changing `server.mjs`: in a 
 | `OPENCODE_MODEL` | `deepseek/deepseek-flash` | model used for the `effort` variants |
 | `OPENCODE_TIMEOUT_MS` | 60 min | default wall-clock limit per job; normally left unset (pass `timeout_seconds` per job instead, max 4 h) |
 | `OPENCODE_IDLE_MS` | 20 min | default limit without any output (`idle_seconds` overrides) |
-| `OPENCODE_MAX_CONCURRENT` | 10 | jobs running at once per server |
+| `OPENCODE_MAX_CONCURRENT` | 10 | jobs running at once on this machine, all sessions together |
+| `OPENCODE_LOCAL_CONCURRENT` | 2 | jobs running at once on one local model |
 | `OPENCODE_MAX_REPLY_CHARS` | 20000 | cap on any reply |
 | `OPENCODE_INCLUDE_FREE` | off | `1` lists OpenCode's own free models too |
 | `OPENCODE_KEEP_OLD_MODELS` | off | `1` lists older versions of each model line too |

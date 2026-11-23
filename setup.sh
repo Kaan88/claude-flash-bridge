@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# One-step setup and update of the deepseek-flash bridge on macOS and Linux:
+# One-step setup and update of the OpenCode bridge on macOS and Linux:
 #   curl -fsSL https://raw.githubusercontent.com/Kaan88/claude-flash-bridge/main/setup.sh | bash
 # Installs only what is missing: Claude Code, OpenCode, Node.js (through Homebrew on macOS) and this bridge. A
 # bridge already installed is used where it is (the copy Claude is registered with, else
@@ -59,7 +59,7 @@ const desktop = process.platform === "win32" ? p.join(process.env.APPDATA || "",
   : p.join(os.homedir(), ".config", "Claude", "claude_desktop_config.json");
 for (const f of [p.join(os.homedir(), ".claude.json"), desktop]) {
   try {
-    const s = (JSON.parse(fs.readFileSync(f, "utf8")).mcpServers || {})["deepseek-flash"];
+    const m = JSON.parse(fs.readFileSync(f, "utf8")).mcpServers || {}, s = m.opencode || m["deepseek-flash"];
     const server = ((s && s.args) || []).find((a) => /server\.mjs$/.test(a));
     if (server && fs.existsSync(server)) { console.log(p.dirname(server)); break; }
   } catch {}

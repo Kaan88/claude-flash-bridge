@@ -110,15 +110,17 @@ editJson(ocConfig, (c) => {
 });
 
 // 2. Claude Code CLI, user scope
-try {
-  execSync("claude mcp remove --scope user deepseek-flash", { stdio: "ignore" });
-} catch {}
+// registered as "opencode" (tools opencode_run / opencode_result / opencode_cancel); "deepseek-flash" is the old name
+for (const name of ["deepseek-flash", "opencode"])
+  try {
+    execSync(`claude mcp remove --scope user ${name}`, { stdio: "ignore" });
+  } catch {}
 try {
   const envArgs = Object.entries(serverEnv).map(([k, v]) => `-e "${k}=${v}" `).join("");
-  execSync(`claude mcp add --scope user ${envArgs}deepseek-flash -- "${node}" "${server}"`, { stdio: "inherit" });
-  ok("Claude Code: deepseek-flash registered (user scope)");
+  execSync(`claude mcp add --scope user ${envArgs}opencode -- "${node}" "${server}"`, { stdio: "inherit" });
+  ok("Claude Code: opencode registered (user scope)");
 } catch {
-  warn("Claude Code CLI not found or failed; run: claude mcp add --scope user deepseek-flash -- node " + server);
+  warn("Claude Code CLI not found or failed; run: claude mcp add --scope user opencode -- node " + server);
 }
 
 // 3. Claude Desktop
@@ -131,7 +133,8 @@ const desktop =
 if (!existsSync(desktop) && existsSync(dirname(desktop))) writeFileSync(desktop, "{}\n");
 editJson(desktop, (c) => {
   c.mcpServers ??= {};
-  c.mcpServers["deepseek-flash"] = { command: node, args: [server], env: serverEnv };
+  delete c.mcpServers["deepseek-flash"];
+  c.mcpServers.opencode = { command: node, args: [server], env: serverEnv };
 });
 
 // Claude Code's own wait on a tool call; jobs return at once now, so this is only a safety net.
