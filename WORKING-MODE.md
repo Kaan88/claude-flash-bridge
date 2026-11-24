@@ -38,6 +38,8 @@ stronger or different model than Flash. It runs with the same agent and the same
 
 `opencode_run` returns at once with a job id; it does not wait for the work. Get the reply with
 `opencode_result { job }` (or `{ jobs: [...] }` for several, returning whichever finishes first), which waits up to ~55 s per call and says "still running" until the job is done.
+These jobs are not Claude Code background tasks: nothing notifies you when one ends, so never wait with sleep,
+Monitor, wakeups, a background shell loop or a subagent, and don't end the turn while you still need a reply.
 Start parallel jobs first, then collect their results; don't redo or re-send a job that is still running, and
 don't start a second job on the same files while one may still be editing them. A job that runs long builds or
 test suites gets a larger `timeout_seconds`; `opencode_cancel { job }` stops one that went wrong. A

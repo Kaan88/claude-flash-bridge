@@ -485,7 +485,7 @@ const buildTool = () => ({
   name: "opencode_run",
   description:
     workersText() +
-    "Runs a task in the background on another model and returns AT ONCE with a job id; get the answer (and its session id) with `opencode_result`. To run several, start them all, then pass every id to `opencode_result` as `jobs`. " +
+    "Starts a task on another model and returns AT ONCE with a job id. Not a Claude Code background task: no notification comes when it ends; wait for the answer (and its session id) by calling `opencode_result` until it is done.To run several, start them all, then pass every id to `opencode_result` as `jobs`. " +
     "Models: OpenCode's (default DeepSeek Flash; any other via `model`, listed in its description), or Claude Code itself via `model` claude-code/fable, opus, sonnet or haiku (" +
     "your Claude plan, Claude Code's tools and CLAUDE.md, no MCP servers). " +
     "A new session starts with NO context: put everything it needs in `prompt` (paths, goal, constraints, output format). Pass `session` to continue an earlier one instead. " +
@@ -931,6 +931,20 @@ function progress(s) {
   const retry = s.retry ? `, provider retrying (${s.retry})` : "";
   return `${s.id} still ${since}${quiet}${tool}${files}${retry} (limit ${s.timeoutMs / 1000}s, idle ${s.idleMs / 1000}s)`;
 }
+const NO_NOTICE = "No notification will come: call opencode_result again now to keep waiting.";
+function progressOne(s) {
+  return `${progress(s)}. ${NO_NOTICE}`;
+}
+
+// Shown in the client's system prompt even while the tools are deferred. Claude Code's own background tasks
+// (run_in_background, background subagents) notify the session when they end; these jobs never do, and a session
+// that treats them that way waits for nothing or polls now and then with sleep, Monitor or wakeups.
+const SERVER_INSTRUCTIONS =
+  "Jobs from `opencode_run` are not Claude Code background tasks: no notification ever arrives when one finishes. " +
+  "The way to wait is `opencode_result`, which blocks up to 55 s per call: start every job you need, then call `opencode_result` " +
+  "with all their ids as `jobs`, and call it again right away while it says jobs are still running, until it says \"All done.\" " +
+  "You may do other work of your own between calls, but never wait with sleep, Monitor, ScheduleWakeup, cron, a background Bash loop " +
+  "or a subagent, and never end your turn while a job you need is still running.";
 
 const send = (msg) => process.stdout.write(JSON.stringify(msg) + "\n");
 
@@ -943,7 +957,8 @@ async function handle(msg) {
       result: {
         protocolVersion: params?.protocolVersion || "2025-06-18",
         capabilities: { tools: { listChanged: true } },
-        serverInfo: { name: "opencode-agent", version: "2.3.1" },
+        serverInfo: { name: "opencode-agent", version: "2.3.2" },
+        instructions: SERVER_INSTRUCTIONS,
       },
     });
   }
@@ -967,7 +982,7 @@ async function handle(msg) {
       const job = startJob(a);
       const s = jobs.get(job).state;
       const on = a.model || a.effort ? ` on ${a.model || resolveModel(a)}${a.effort ? `#${a.effort}` : ""}` : "";
-      return reply(`started ${job}${on}${waiting}, limit ${s.timeoutMs / 1000}s, idle ${s.idleMs / 1000}s. Get the answer with opencode_result { job: "${job}" }, or several ids at once as \`jobs\`.`);
+      return reply(`started ${job}${on}${waiting}, limit ${s.timeoutMs / 1000}s, idle ${s.idleMs / 1000}s. Nothing notifies you when it ends: wait for it with opencode_result { job: "${job}" } (or several ids at once as \`jobs\`), repeated until it is done.`);
     }
     if (params?.name === RESULT_TOOL.name) {
       const ids = [...new Set([...(Array.isArray(a.jobs) ? a.jobs : []), ...(a.job ? [a.job] : [])].map(String))];
@@ -989,7 +1004,7 @@ async function handle(msg) {
       }
       if (ids.length === 1) {
         const s = found.get(ids[0]).state;
-        if (pending(s)) return reply(progress(s));
+        if (pending(s)) return reply(progressOne(s));
         return reply(s.reply || `${ids[0]} ${s.status}`, !s.ok);
       }
       const parts = [];
@@ -1005,7 +1020,7 @@ async function handle(msg) {
         }
       }
       const left = ids.filter((jid) => found.get(jid) && pending(found.get(jid).state)).length;
-      lines.push(left ? `${left} still running: repeat this call to wait for the next.` : "All done.");
+      lines.push(left ? `${left} still running. ${NO_NOTICE}` : "All done.");
       return reply([...parts, lines.join("\n")].join("\n\n"));
     }
     if (params?.name === CANCEL_TOOL.name) {
