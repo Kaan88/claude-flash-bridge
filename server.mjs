@@ -116,7 +116,7 @@ mkdirSync(STATE_DIR, { recursive: true });
 const LOCAL_CONCURRENT = Math.max(1, Number(process.env.OPENCODE_LOCAL_CONCURRENT || 6));
 const SLOT_DIR = join(STATE_DIR, "slots");
 mkdirSync(SLOT_DIR, { recursive: true });
-const held = new Set();
+const held = new Map(); // slot path -> the job it is held for
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 function slotInfo(path) {
@@ -134,24 +134,28 @@ function slotOwner(path) {
 // finished is also stale (a release that never ran).
 const SLOT_BEAT_MS = 5000;
 const SLOT_STALE_MS = 30000;
+// The rule itself, without the file system: `ageMs` since the last heartbeat, `jobStatus` of the job it names
+// ("" when unknown). Only a running or queued job holds a place: a finished one never does, fetched or not.
+export function slotIsStale({ ageMs, ownerAlive, jobStatus }) {
+  if (ageMs > SLOT_STALE_MS) return true;
+  if (!ownerAlive) return true;
+  return !!jobStatus && jobStatus !== "running" && jobStatus !== "queued";
+}
 function slotStale(path) {
   const info = slotInfo(path);
   if (!info) return false; // being written, or just released
+  let ageMs;
   try {
-    if (Date.now() - statSync(path).mtimeMs > SLOT_STALE_MS) return true;
+    ageMs = Date.now() - statSync(path).mtimeMs;
   } catch {
     return false;
   }
-  if (!alive(info.pid)) return true;
-  if (info.job && !held.has(path)) {
-    const state = readState(info.job);
-    if (state && state.status !== "running" && state.status !== "queued") return true;
-  }
-  return false;
+  const state = info.job ? jobs.get(info.job)?.state || readState(info.job) : null;
+  return slotIsStale({ ageMs, ownerAlive: alive(info.pid), jobStatus: state?.status || "" });
 }
 setInterval(() => {
   const now = new Date();
-  for (const p of held) {
+  for (const p of held.keys()) {
     try {
       utimesSync(p, now, now);
     } catch {
@@ -201,7 +205,7 @@ function tryTake(pool, size, jobId) {
     for (let attempt = 0; attempt < 2; attempt++) {
       try {
         writeFileSync(path, JSON.stringify({ pid: process.pid, job: jobId }), { flag: "wx" });
-        held.add(path);
+        held.set(path, jobId);
         return path;
       } catch (e) {
         if (e.code !== "EEXIST") break;
@@ -224,6 +228,10 @@ function release(path) {
   } catch {
     // already gone
   }
+}
+// A job that ended gives its places back at once, whatever happens to the code that was waiting on it.
+function releaseJob(jobId) {
+  for (const [p, j] of held) if (j === jobId) release(p);
 }
 // slots of a pool currently held by a live server
 function inUse(pool) {
@@ -264,7 +272,7 @@ async function limited(job, local, fn) {
   }
 }
 process.on("exit", () => {
-  for (const p of held) {
+  for (const p of held.keys()) {
     try {
       unlinkSync(p);
     } catch {
@@ -807,6 +815,7 @@ function finish(job, status, reply, ok = false) {
   s.reply = cap(reply, MAX_REPLY, s.log);
   s.finished = Date.now();
   saveState(s);
+  releaseJob(s.id);
   return s;
 }
 
@@ -1133,21 +1142,25 @@ function shutdown() {
   for (const j of jobs.values()) if (j.state.status === "running") j.cancel?.();
   setTimeout(() => process.exit(0), 300);
 }
-process.stdin.on("end", shutdown);
-process.on("SIGTERM", shutdown);
 
-// read the live catalog now; with a cached one, tools/list doesn't wait for it
-refreshCatalog();
-if (CLAUDE_EXE)
-  watchFile(WORKERS_FILE, { interval: 3000, persistent: false }, () => {
-    if (clientReady) send({ jsonrpc: "2.0", method: "notifications/tools/list_changed" });
+// OPENCODE_BRIDGE_NO_MAIN=1 (the tests) loads this file for its functions without serving stdin.
+if (process.env.OPENCODE_BRIDGE_NO_MAIN !== "1") {
+  process.stdin.on("end", shutdown);
+  process.on("SIGTERM", shutdown);
+
+  // read the live catalog now; with a cached one, tools/list doesn't wait for it
+  refreshCatalog();
+  if (CLAUDE_EXE)
+    watchFile(WORKERS_FILE, { interval: 3000, persistent: false }, () => {
+      if (clientReady) send({ jsonrpc: "2.0", method: "notifications/tools/list_changed" });
+    });
+
+  createInterface({ input: process.stdin }).on("line", (line) => {
+    if (!line.trim()) return;
+    try {
+      handle(JSON.parse(line));
+    } catch (e) {
+      process.stderr.write(`bad message: ${e.message}\n`);
+    }
   });
-
-createInterface({ input: process.stdin }).on("line", (line) => {
-  if (!line.trim()) return;
-  try {
-    handle(JSON.parse(line));
-  } catch (e) {
-    process.stderr.write(`bad message: ${e.message}\n`);
-  }
-});
+}
