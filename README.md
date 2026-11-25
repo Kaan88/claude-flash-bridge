@@ -34,8 +34,8 @@ the server sends `tools/list_changed` and Claude re-reads it. An unknown model t
 Passing `effort` without `model` now applies it to the chosen agent's own model (it used to always apply to `OPENCODE_MODEL`).
 
 The call returns at once so that a long job can never hit a tool-call timeout (it used to, and lost the reply
-while the edits landed anyway). At most 10 jobs run at once on the machine, across every Claude session (`OPENCODE_MAX_CONCURRENT`), and at most 2 on any one
-local model (`OPENCODE_LOCAL_CONCURRENT`), since a local server mostly answers one request at a time; further jobs queue.
+while the edits landed anyway). At most 10 jobs run at once on the machine, across every Claude session (`OPENCODE_MAX_CONCURRENT`), and at most 6 on any one
+local model (`OPENCODE_LOCAL_CONCURRENT`), further jobs queue. Lower it for a server that answers one request at a time.
 The slots are files in `<state folder>/slots`. A server touches its slot files every 5 seconds; a slot is freed automatically when its server exited, stopped touching it for 30 seconds (Windows reuses process ids, so a live id alone proves nothing), or its job already finished. A queued job says which jobs hold the places (`waiting: 2 job(s) already on this local model: job_a_1 (running 340s), ...`), and `opencode_cancel` on one of those ids stops it and, if its server is gone or it has no record, frees its place.
 
 **Limits.** A job is stopped after `timeout_seconds` (default `OPENCODE_TIMEOUT_MS`, 60 min, max 4 h) or when
@@ -152,7 +152,7 @@ Each session runs its own copy of the server. After changing `server.mjs`: in a 
 | `OPENCODE_TIMEOUT_MS` | 60 min | default wall-clock limit per job; normally left unset (pass `timeout_seconds` per job instead, max 4 h) |
 | `OPENCODE_IDLE_MS` | 20 min | default limit without any output (`idle_seconds` overrides) |
 | `OPENCODE_MAX_CONCURRENT` | 10 | jobs running at once on this machine, all sessions together |
-| `OPENCODE_LOCAL_CONCURRENT` | 2 | jobs running at once on one local model |
+| `OPENCODE_LOCAL_CONCURRENT` | 6 | jobs running at once on one local model |
 | `CLAUDE_EXE` | found on PATH or in `~/.local/bin` | Claude Code CLI for `claude-code/*` jobs |
 | `OPENCODE_CLAUDE` | on | `0` hides the `claude-code/*` models |
 | `OPENCODE_MAX_REPLY_CHARS` | 20000 | cap on any reply |

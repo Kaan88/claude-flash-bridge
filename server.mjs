@@ -113,7 +113,7 @@ mkdirSync(STATE_DIR, { recursive: true });
 // OPENCODE_MAX_CONCURRENT jobs run at once machine-wide (all Claude sessions together), and at most
 // OPENCODE_LOCAL_CONCURRENT at once on any one local model, which a local server mostly runs one request at a time.
 // A slot is a file created exclusively in <state>/slots; a slot whose owner process has exited is free again.
-const LOCAL_CONCURRENT = Math.max(1, Number(process.env.OPENCODE_LOCAL_CONCURRENT || 2));
+const LOCAL_CONCURRENT = Math.max(1, Number(process.env.OPENCODE_LOCAL_CONCURRENT || 6));
 const SLOT_DIR = join(STATE_DIR, "slots");
 mkdirSync(SLOT_DIR, { recursive: true });
 const held = new Set();
