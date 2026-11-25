@@ -48,40 +48,78 @@ const CLAUDE_MODELS = CLAUDE_EXE
   : [];
 // Claude sessions are UUIDs, OpenCode's start with "ses_": a session alone says which worker continues it.
 const CLAUDE_SESSION = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-// Named Claude Code workers (OpenCode Config Studio's "Claude workers" page), picked with `agent: "<name>"`:
-// { "workers": { "cc-reviewer": { "model": "sonnet", "effort": "high", "readOnly": true, "description": "…", "instructions": "…" } } }
-const WORKERS_FILE = process.env.CLAUDE_WORKERS_FILE || join(homedir(), ".claude", "claude-workers.json");
-let workersCache = { mtime: -1, list: {} };
-function workers() {
-  if (!CLAUDE_EXE) return {};
-  let mtime = 0;
+const DEFAULT_AGENT = process.env.OPENCODE_AGENT || "deepseek-flash";
+
+// ---- workers: the one list of what a caller may run ----
+// A caller (Claude) sees and can run only the workers the user set up, each picked by name with `worker`. A worker
+// runs either an OpenCode agent or Claude Code itself. The list is ~/.config/opencode-bridge/workers.json
+// (BRIDGE_WORKERS_FILE), edited on OpenCode Config Studio's Workers page:
+// { "default": "deepseek-flash", "workers": {
+//     "deepseek-flash": { "runs": "opencode", "agent": "deepseek-flash", "effort": "high", "description": "…" },
+//     "cc-reviewer":    { "runs": "claude", "model": "opus", "effort": "high", "readOnly": true, "instructions": "…" } } }
+// An OpenCode worker may also name a `model` (provider/id) to run its agent on. While the file does not exist the
+// list is one OpenCode worker for the default agent plus the older Claude workers file (~/.claude/claude-workers.json),
+// so an install from before the list keeps working. OPENCODE_ALLOW_ANY=1 brings back the older behaviour, where
+// any OpenCode agent or model can be asked for with `agent` and `model`.
+const ALLOW_ANY = process.env.OPENCODE_ALLOW_ANY === "1";
+const WORKERS_FILE = process.env.BRIDGE_WORKERS_FILE || join(homedir(), ".config", "opencode-bridge", "workers.json");
+const LEGACY_WORKERS_FILE = process.env.CLAUDE_WORKERS_FILE || join(homedir(), ".claude", "claude-workers.json");
+const CLAUDE_ALIASES = ["fable", "opus", "sonnet", "haiku"];
+const WORKER_NAME = /^[A-Za-z0-9][\w.-]*$/;
+const mtimeOf = (file) => {
   try {
-    mtime = statSync(WORKERS_FILE).mtimeMs;
+    return statSync(file).mtimeMs;
   } catch {
-    return {};
+    return 0;
   }
-  if (mtime !== workersCache.mtime) {
-    let list = {};
-    try {
-      const raw = JSON.parse(readFileSync(WORKERS_FILE, "utf8")).workers || {};
-      for (const [name, w] of Object.entries(raw))
-        if (/^[A-Za-z0-9][\w.-]*$/.test(name) && w && typeof w === "object" && !w.disabled)
-          list[name] = {
-            model: ["fable", "opus", "sonnet", "haiku"].includes(w.model) ? w.model : "sonnet",
-            effort: CLAUDE_EFFORTS.includes(w.effort) ? w.effort : "",
-            readOnly: !!w.readOnly,
-            description: String(w.description || "").slice(0, 200),
-            instructions: String(w.instructions || ""),
-          };
-    } catch {
-      list = workersCache.list; // half-written or invalid: keep the last good list
-    }
-    workersCache = { mtime, list };
-  }
-  return workersCache.list;
+};
+// One entry of a workers file as the bridge uses it, or null when it is switched off or incomplete.
+export function readWorker(name, w, legacy = false) {
+  if (!WORKER_NAME.test(name) || !w || typeof w !== "object" || w.disabled) return null;
+  const runs = legacy ? "claude" : w.runs;
+  const base = { name, runs, readOnly: !!w.readOnly, description: String(w.description || "").slice(0, 200) };
+  if (runs === "claude")
+    return { ...base, model: CLAUDE_ALIASES.includes(w.model) ? w.model : "sonnet", effort: CLAUDE_EFFORTS.includes(w.effort) ? w.effort : "", instructions: String(w.instructions || "") };
+  if (runs !== "opencode" || typeof w.agent !== "string" || !w.agent) return null;
+  return { ...base, agent: w.agent, model: typeof w.model === "string" ? w.model.replace(/#.*$/, "") : "", effort: typeof w.effort === "string" ? w.effort : "" };
 }
+let workersCache = { key: "", list: {}, def: "" };
+function workerSet() {
+  const mtime = mtimeOf(WORKERS_FILE);
+  const legacy = mtime ? 0 : mtimeOf(LEGACY_WORKERS_FILE);
+  const key = `${mtime}:${legacy}`;
+  if (key === workersCache.key) return workersCache;
+  let list = {};
+  let def = "";
+  try {
+    if (mtime) {
+      const raw = JSON.parse(readFileSync(WORKERS_FILE, "utf8"));
+      for (const [name, w] of Object.entries(raw.workers || {})) {
+        const entry = readWorker(name, w);
+        if (entry) list[name] = entry;
+      }
+      def = typeof raw.default === "string" && list[raw.default] ? raw.default : "";
+    } else {
+      list[DEFAULT_AGENT] = { name: DEFAULT_AGENT, runs: "opencode", agent: DEFAULT_AGENT, model: "", effort: "", readOnly: false, description: "" };
+      if (legacy)
+        for (const [name, w] of Object.entries(JSON.parse(readFileSync(LEGACY_WORKERS_FILE, "utf8")).workers || {})) {
+          const entry = name === DEFAULT_AGENT ? null : readWorker(name, w, true);
+          if (entry) list[name] = entry;
+        }
+    }
+    // no default named: the first OpenCode worker (work that leaves the Claude plan alone), else the first one
+    def ||= Object.values(list).find((w) => w.runs === "opencode")?.name || Object.keys(list)[0] || "";
+  } catch {
+    ({ list, def } = workersCache); // half-written or invalid: keep the last good list
+  }
+  workersCache = { key, list, def };
+  return workersCache;
+}
+// The Claude Code workers alone, by name (what `agent` could name before there was one list).
+const workers = () => (CLAUDE_EXE ? Object.fromEntries(Object.entries(workerSet().list).filter(([, w]) => w.runs === "claude")) : {});
+// `_w` is the worker a call was resolved to; without it (OPENCODE_ALLOW_ANY) the arguments say what runs.
 const isClaudeJob = (a) =>
-  String(a.model || "").startsWith(`${CLAUDE_PROVIDER}/`) || CLAUDE_SESSION.test(String(a.session || "")) || !!(a.agent && workers()[a.agent]);
+  a._w ? a._w.runs === "claude" : String(a.model || "").startsWith(`${CLAUDE_PROVIDER}/`) || CLAUDE_SESSION.test(String(a.session || "")) || !!(a.agent && workers()[a.agent]);
 // What a read-only Claude job may do: read, search, look things up, and run read-only git commands.
 const CLAUDE_READ_TOOLS = ["Read", "Grep", "Glob", "WebFetch", "WebSearch", "Bash(git status*)", "Bash(git diff*)", "Bash(git log*)", "Bash(git show*)"];
 // The host session's CLAUDE_* variables would tie the worker to it (its session id, messaging socket): drop them.
@@ -90,7 +128,6 @@ function claudeEnv(cwd) {
   for (const k of Object.keys(env)) if (/^CLAUDE/i.test(k)) delete env[k];
   return env;
 }
-const DEFAULT_AGENT = process.env.OPENCODE_AGENT || "deepseek-flash";
 // Read-only jobs run without --auto, so an agent whose edits and shell commands are "ask" can't change anything:
 // OpenCode rejects every ask when nobody can answer. Such an agent serves both kinds of job. An older install's
 // separate read-only twin (<agent>-ro, edits denied) is still used when it exists.
@@ -112,6 +149,45 @@ const LAST_TEXT = 2000;
 const KEEP_MS = 24 * 60 * MIN;
 const STATE_DIR = process.env.OPENCODE_STATE_DIR || join(tmpdir(), "opencode-agent");
 mkdirSync(STATE_DIR, { recursive: true });
+// Job files (state, raw event log) older than this many days are deleted when a server starts; 0 keeps them all.
+const KEEP_DAYS = Number(process.env.OPENCODE_KEEP_DAYS ?? 3);
+function pruneFiles(now = Date.now()) {
+  if (!(KEEP_DAYS > 0)) return 0;
+  let n = 0;
+  try {
+    for (const f of readdirSync(STATE_DIR)) {
+      if (!/^job_[a-z0-9]+_\d+\.(json|jsonl|cancel)$/.test(f)) continue;
+      const p = join(STATE_DIR, f);
+      try {
+        if (now - statSync(p).mtimeMs > KEEP_DAYS * 24 * 60 * MIN) {
+          unlinkSync(p);
+          n++;
+        }
+      } catch {
+        // gone, or in use
+      }
+    }
+  } catch {
+    // no state folder
+  }
+  return n;
+}
+
+// ---- how long one opencode_result call may wait ----
+// A wait is one tool call, and a tool call that is waiting costs the caller nothing. A poll every 55 s costs one model
+// request each time, with the whole conversation read again. Claude Code lets a tool call run long (its limit is
+// MCP_TOOL_TIMEOUT, far longer when unset, and 30 minutes without any progress message) and moves a call that
+// runs over two minutes to the background, telling the session when it settles. Other clients cut a call short
+// (Claude Desktop's chat: 180 s by default), so they get short waits. OPENCODE_WAIT_SECONDS sets it for every client.
+const WAIT_ENV = Number(process.env.OPENCODE_WAIT_SECONDS);
+let clientName = "";
+export function waitLimit({ env = WAIT_ENV, client = clientName, toolTimeoutMs = Number(process.env.MCP_TOOL_TIMEOUT) } = {}) {
+  if (Number.isFinite(env) && env > 0) return env;
+  if (!/claude-code/i.test(client)) return 150;
+  const byClient = Number.isFinite(toolTimeoutMs) && toolTimeoutMs > 0 ? toolTimeoutMs / 1000 - 60 : Infinity;
+  return Math.max(55, Math.min(1500, byClient));
+}
+const PROGRESS_MS = Math.max(250, Number(process.env.OPENCODE_PROGRESS_MS || 20000));
 
 // ---- job slots, shared by every server instance on this machine ----
 // OPENCODE_MAX_CONCURRENT jobs run at once machine-wide (all Claude sessions together), and at most
@@ -388,17 +464,19 @@ async function fetchCatalog() {
   for (const [ref, b] of bases) all.get(ref).offline = !up.get(b);
   // what an agent runs on: its own model and variant, else OpenCode's default model
   // can this agent change files when nothing approves its asks? (the last matching rule wins)
+  // Both edits and shell commands must need an approval: an agent that asks before edits but runs any shell
+  // command freely can still change files in a read-only job.
   const guarded = (a) => {
-    const rules = (a.permissions || a.permission || []).filter((r) => (r.action === "edit" || r.action === "*") && r.resource === "*");
-    return rules.length ? rules.at(-1).effect !== "allow" : false;
+    const last = (action) => (a.permissions || a.permission || []).filter((r) => (r.action === action || r.action === "*") && r.resource === "*").at(-1);
+    return [last("edit"), last("shell")].every((r) => r && r.effect !== "allow");
   };
   const agentModel = (a) => (a.model?.id ? `${a.model.providerID}/${a.model.id}${a.model.variant ? `#${a.model.variant}` : ""}` : def ? `${refOf(def)} (default)` : "default model");
   return {
     at: Date.now(),
     // every enabled model, free ones included, so a job on an agent's own (possibly free) model still validates
     models: [...all.values()],
+    // hidden agents too: a worker may run an agent that OpenCode's own picker does not show
     agents: agents
-      .filter((a) => !a.hidden || a.id === READONLY_AGENT)
       .map((a) => ({ name: a.id, hidden: !!a.hidden, mode: a.mode, guarded: guarded(a), model: agentModel(a), description: (a.description || "").split(/(?<=\.)\s/)[0].slice(0, 90) })),
     defaultModel: def ? refOf(def) : null,
   };
@@ -590,7 +668,7 @@ async function validate(args) {
     if (args.agent && !catalog.agents.some((a) => a.name === args.agent)) return `unknown agent "${args.agent}". Agents: ${catalog.agents.filter((a) => !a.hidden).map((a) => a.name).join(", ")}`;
     const info = catalog.agents.find((a) => a.name === pickAgent(args));
     if (!args.allow_edits && info?.guarded === false)
-      return `agent "${info.name}" can edit files and run commands without asking, so it can't run a read-only job. Pass allow_edits: true, or leave \`agent\` out and choose the model with \`model\` instead.`;
+      return `agent "${info.name}" can edit files and run commands without asking, so it can't run a read-only job. Pass allow_edits: true, or ${args._w ? "pick another worker" : "leave `agent` out and choose the model with `model` instead"}.`;
     const ref = resolveModel(args);
     const m = findModel(ref);
     // the model that will run, whether named, an alias, or an agent's own: the same switch applies
@@ -619,7 +697,141 @@ async function validate(args) {
   return err;
 }
 
-const buildTool = () => ({
+// ---- picking the worker of a call ----
+
+// The model an OpenCode worker runs on: its own `model`, else its agent's.
+function workerModel(w) {
+  if (w.runs === "claude") return `${CLAUDE_PROVIDER}/${w.model}`;
+  if (w.model) return w.model;
+  const a = catalog?.agents.find((x) => x.name === w.agent);
+  return a ? a.model.replace(/#.*$|\s.*$/, "") : "";
+}
+// One line per worker for the caller: what runs it, whose bill it is, its effort levels and what it is for.
+function workerLine(w, isDefault) {
+  const facts = [];
+  if (w.runs === "claude") {
+    facts.push(`Claude Code ${w.model}`, "uses the Claude plan");
+    if (w.effort) facts.push(`effort ${w.effort}`);
+  } else {
+    const ref = workerModel(w);
+    const levels = ref ? findModel(ref)?.efforts || [] : [];
+    facts.push(`OpenCode agent ${w.agent}${ref ? ` on ${ref}` : ""}`, "not the Claude plan");
+    if (levels.length) facts.push(`efforts ${effortLabel(levels)}`);
+    if (w.effort) facts.push(`usually ${w.effort}`);
+  }
+  if (w.readOnly) facts.push("read-only");
+  if (isDefault) facts.push("the default");
+  return `${w.name} (${facts.join(", ")})${w.description ? `: ${w.description}` : ""}`;
+}
+function workerLines() {
+  const { list, def } = workerSet();
+  return Object.values(list).map((w) => workerLine(w, w.name === def));
+}
+// every effort level any worker's model has, in ladder order
+function workerEfforts() {
+  const used = new Set();
+  for (const w of Object.values(workerSet().list)) for (const e of w.runs === "claude" ? CLAUDE_EFFORTS : findModel(workerModel(w))?.efforts || []) used.add(e);
+  const levels = EFFORT_LADDER.filter((l) => used.has(l));
+  return levels.length ? levels : FALLBACK_EFFORTS;
+}
+// The worker that ran a session, from the jobs this machine remembers (newest first).
+function workerOfSession(session) {
+  let best = null;
+  const see = (s) => {
+    if (s?.session === session && s.worker && (!best || s.started > best.started)) best = s;
+  };
+  for (const j of jobs.values()) see(j.state);
+  if (!best)
+    try {
+      for (const f of readdirSync(STATE_DIR)) {
+        if (!/^job_[a-z0-9]+_\d+\.json$/.test(f)) continue;
+        const raw = readFileSync(join(STATE_DIR, f), "utf8");
+        if (raw.includes(JSON.stringify(session))) see(JSON.parse(raw));
+      }
+    } catch {
+      // a file being rewritten: the default worker is tried instead
+    }
+  return best?.worker;
+}
+// Resolves a call to one worker and rewrites its arguments to what that worker runs. Returns an error text or "".
+// `worker` names it; a call written for an older version may name a worker with `agent`; a continued session goes
+// back to the worker that ran it; otherwise the default worker. Any other `agent` or `model` is refused: the list
+// is the only way in.
+function useWorker(a) {
+  const { list, def } = workerSet();
+  const offer = `Workers: ${Object.keys(list).join(", ") || "(none set up; add one in OpenCode Config Studio)"}`;
+  let name = a.worker;
+  if (name !== undefined && !list[name]) return `unknown worker "${name}". ${offer}`;
+  if (name === undefined && a.agent && list[a.agent]) name = a.agent;
+  if (name === undefined && (a.agent || a.model))
+    return `${a.model ? `model "${a.model}"` : `agent "${a.agent}"`} is not a worker. This bridge runs only the workers its user set up; pick one with \`worker\`. ${offer}`;
+  if (a.worker !== undefined && a.model) return `\`model\` is not accepted: worker "${name}" decides what it runs on. ${offer}`;
+  if (name === undefined && a.session) name = workerOfSession(a.session);
+  if (name === undefined || !list[name]) name = def;
+  const w = list[name];
+  if (!w) return `no worker is set up. ${offer}`;
+  const claudeSession = CLAUDE_SESSION.test(String(a.session || ""));
+  if (a.session && claudeSession !== (w.runs === "claude"))
+    return `session ${a.session} is ${claudeSession ? "a Claude Code" : "an OpenCode"} session and worker "${name}" runs ${w.runs === "claude" ? "Claude Code" : "OpenCode"}; pass the worker that started it as \`worker\`. ${offer}`;
+  if (w.readOnly && a.allow_edits) return `worker "${name}" is read-only; run it without allow_edits, or pick another worker. ${offer}`;
+  a._w = w;
+  a.agent = w.runs === "claude" ? undefined : w.agent;
+  a.model = w.runs === "claude" ? `${CLAUDE_PROVIDER}/${w.model}` : w.model || undefined;
+  a.effort ||= w.effort || undefined;
+  return "";
+}
+
+const TOOL_TAIL = () =>
+  "A new session starts with NO context: put everything it needs in `prompt` (paths, goal, constraints, output format). Pass `session` to continue an earlier one instead. " +
+  "Without `allow_edits` the job is read-only (enforced, not just asked): it can read, search and run read-only commands. " +
+  `At most ${MAX_CONCURRENT} jobs run at once on this machine and ${LOCAL_CONCURRENT} per local model; more queue (\`opencode_list\` shows them). A job stops after \`timeout_seconds\` (default ${TIMEOUT_MS / 1000}), or \`idle_seconds\` without output (default ${IDLE_MS / 1000}; ${TOOL_IDLE_MS / 1000} while a tool call such as a build is in flight).`;
+const COMMON_PROPS = () => ({
+  prompt: { type: "string", description: "Full, self-contained task description." },
+  directory: { type: "string", description: "Working directory for the worker (absolute path). Defaults to this server's cwd." },
+  files: { type: "array", items: { type: "string" }, description: "Absolute paths of files to attach to the prompt." },
+  allow_edits: { type: "boolean", description: "Let the worker modify files and run commands (also approves its permission prompts). Default false: a read-only job." },
+  session: {
+    type: "string",
+    description: "Session id returned by an earlier call (the `session:` line). Continues that conversation with all its context: send only the follow-up (review findings, next step), not the whole spec again.",
+  },
+  timeout_seconds: { type: "number", description: `Wall-clock limit for this job. Default ${TIMEOUT_MS / 1000}, max ${MAX_TIMEOUT_MS / 1000}. Raise it for jobs that run long builds or test suites.` },
+  idle_seconds: { type: "number", description: `Stop the job when it prints nothing for this long and no tool call is in flight. Default ${IDLE_MS / 1000}, at most the wall-clock limit.` },
+  tool_idle_seconds: { type: "number", description: `The idle limit while a tool call (a build, a test run) is in flight. Default ${TOOL_IDLE_MS / 1000}, at least idle_seconds, at most the wall-clock limit.` },
+});
+// What a caller sees: the workers, by name. No model catalog and no agent list: those are not for it to choose from.
+const buildWorkerTool = () => {
+  const { list, def } = workerSet();
+  const { prompt, ...rest } = COMMON_PROPS();
+  return {
+    name: "opencode_run",
+    description:
+      "Hands a task to a worker (another model working on its own) and returns AT ONCE with a job id. Get the answer, and its session id, with ONE `opencode_result` call, which waits until the job ends; to run several, start them all, then pass every id to it as `jobs`. " +
+      "The workers are the ones the user set up, listed under `worker`: nothing else can be run, and each line says whether it uses the Claude plan. " +
+      TOOL_TAIL(),
+    inputSchema: {
+      type: "object",
+      properties: {
+        prompt,
+        worker: {
+          type: "string",
+          enum: Object.keys(list),
+          description: `Which worker does the job${def ? ` (default ${def})` : ""}. When the user names one, use it.\n${workerLines().join("\n")}`,
+        },
+        ...rest,
+        effort: {
+          type: "string",
+          enum: workerEfforts(),
+          description: "Reasoning effort, one of the worker's own levels. Omit for the worker's usual one. low: summaries, lookups, mechanical edits. max: hard bugs, a second attempt after a failed fix round.",
+        },
+      },
+      required: ["prompt"],
+    },
+  };
+};
+
+const buildTool = () => (ALLOW_ANY ? buildOpenTool() : buildWorkerTool());
+// OPENCODE_ALLOW_ANY=1: every OpenCode model and agent is listed and can be asked for.
+const buildOpenTool = () => ({
   name: "opencode_run",
   description:
     workersText() +
@@ -693,22 +905,23 @@ function effortEnum() {
   return levels.length ? levels : FALLBACK_EFFORTS;
 }
 
-const RESULT_TOOL = {
+const cancelledCalls = new Set(); // ids of tool calls the client gave up on
+const resultTool = () => ({
   name: "opencode_result",
   description:
-    "Get the answers of jobs started with `opencode_run`. Pass one `job`, or several as `jobs`: it waits until ANY of them finishes (up to `wait_seconds`, default 50, max 55), " +
-    "then returns each finished one's reply and session id, and a one-line progress report for each still running. " +
-    "With `jobs`, a reply is returned once: repeat the same call until it says all are done; finished ones then show as one line. " +
+    `Waits for jobs started with \`opencode_run\` and returns their answers. Pass one \`job\`, or several as \`jobs\`: ONE call waits until any of them ends (up to ${waitLimit()} s), ` +
+    "then returns each finished one's reply and session id, and a one-line progress report for each still running. Waiting costs nothing; calling again and again does, so make one call and let it wait. " +
+    "With `jobs`, a reply is returned once: call again only while it says jobs are still running; finished ones then show as one line. " +
     "A timed-out, cancelled or failed job returns a short summary (session, files touched, last text, log path), never the raw log.",
   inputSchema: {
     type: "object",
     properties: {
       job: { type: "string", description: "A job id opencode_run returned (e.g. job_k3x_2)." },
       jobs: { type: "array", items: { type: "string" }, description: "Several job ids: wait for whichever finishes first." },
-      wait_seconds: { type: "number", description: "Wait up to this many seconds for a job to finish. Default 50." },
+      wait_seconds: { type: "number", description: `Leave it out to wait as long as allowed (${waitLimit()} s). 0 looks without waiting.` },
     },
   },
-};
+});
 
 const CANCEL_TOOL = {
   name: "opencode_cancel",
@@ -816,6 +1029,7 @@ function startJob(args) {
     log: logPath(id),
   };
   const job = { state, child: null, cancelled: false };
+  if (args._w) state.worker = args._w.name; // a continued session goes back to this worker
   const ref = resolveModel(args);
   const local = findModel(ref)?.local ? localPool(ref) : null;
   state.model = ref;
@@ -1057,11 +1271,11 @@ function absorbClaude(job, acc, ev) {
   }
 }
 
-function runAgent(job, { prompt, directory, files = [], allow_edits = false, agent, session, effort, model }) {
+function runAgent(job, { prompt, directory, files = [], allow_edits = false, agent, session, effort, model, _w }) {
   return new Promise((resolve) => {
     const s = job.state;
-    const claude = isClaudeJob({ model, session, agent });
-    const worker = claude && agent ? workers()[agent] : null;
+    const claude = isClaudeJob({ model, session, agent, _w });
+    const worker = _w ? (claude ? _w : null) : claude && agent ? workers()[agent] : null;
     if (worker) {
       model ||= `${CLAUDE_PROVIDER}/${worker.model}`;
       effort ||= worker.effort;
@@ -1291,7 +1505,10 @@ function progress(s) {
   const note = s.note ? `, NOTE: ${s.note}` : "";
   return `${s.id} still ${since}${quiet}${tool}${flight}${files}${retry}${note} (limit ${s.timeoutMs / 1000}s, idle ${s.idleMs / 1000}s, ${(s.toolIdleMs || s.idleMs) / 1000}s with a tool in flight)`;
 }
-const NO_NOTICE = "No notification will come: call opencode_result again now to keep waiting.";
+// The same in a few words, for the progress message of a waiting call.
+const progressShort = (s) =>
+  `${s.id} ${s.status === "queued" ? "queued" : `running ${secs(Date.now() - (s.running || s.started))}`}${s.inFlight ? `, ${s.inFlight.label}` : s.lastTool ? `, last tool ${s.lastTool}` : ""}${s.files?.length ? `, ${s.files.length} file(s) edited` : ""}`;
+const NO_NOTICE = "Call opencode_result again to keep waiting (one call, no status message in between).";
 function progressOne(s) {
   return `${progress(s)}. ${NO_NOTICE}`;
 }
@@ -1398,7 +1615,19 @@ async function listText() {
   const states = pendingStates();
   const queued = states.filter((s) => s.status === "queued");
   const lines = states.length ? states.map((s) => listLine(s, queued)) : ["No job is queued or running."];
-  return [...lines, "", "Places:", ...poolLines(), "", ...(await busyLines(states))].join("\n");
+  const who = ALLOW_ANY ? ["Workers: any OpenCode agent or model (OPENCODE_ALLOW_ANY)"] : ["Workers:", ...workerLines()];
+  return [
+    ...lines,
+    "",
+    "Places:",
+    ...poolLines(),
+    "",
+    ...(await busyLines(states)),
+    "",
+    ...who,
+    "",
+    `This server: client "${clientName || "unknown"}", one opencode_result call waits up to ${waitLimit()} s.`,
+  ].join("\n");
 }
 
 // A stopped job's session may still be running inside OpenCode: interrupt it (again) and say how it stands.
@@ -1464,24 +1693,25 @@ async function cancelJob(id) {
 // (run_in_background, background subagents) notify the session when they end; these jobs never do, and a session
 // that treats them that way waits for nothing or polls now and then with sleep, Monitor or wakeups.
 const SERVER_INSTRUCTIONS =
-  "Jobs from `opencode_run` are not Claude Code background tasks: no notification ever arrives when one finishes. " +
-  "The way to wait is `opencode_result`, which blocks up to 55 s per call: start every job you need, then call `opencode_result` " +
-  "with all their ids as `jobs`, and call it again right away while it says jobs are still running, until it says \"All done.\" " +
-  "You may do other work of your own between calls, but never wait with sleep, Monitor, ScheduleWakeup, cron, a background Bash loop " +
-  "or a subagent, and never end your turn while a job you need is still running.";
+  "`opencode_run` hands a task to one of the user's workers (listed in its `worker` parameter; nothing else can be run) and returns a job id at once. " +
+  "Wait with ONE `opencode_result` call that holds every job id: it returns when a job ends, and can wait many minutes. " +
+  "Claude Code may move such a wait to the background after two minutes and tell you when it settles; then carry on with other work, " +
+  "or end the turn, and do not call it again for the same jobs meanwhile. Never poll: no sleep, Monitor, ScheduleWakeup, cron, " +
+  "background shell loop, subagent or short repeated waits, and no status message between waits. Call it again only when it came back with jobs still running.";
 
 const send = (msg) => process.stdout.write(JSON.stringify(msg) + "\n");
 
 async function handle(msg) {
   const { id, method, params } = msg;
   if (method === "initialize") {
+    clientName = String(params?.clientInfo?.name || "");
     return send({
       jsonrpc: "2.0",
       id,
       result: {
         protocolVersion: params?.protocolVersion || "2025-06-18",
         capabilities: { tools: { listChanged: true } },
-        serverInfo: { name: "opencode-agent", version: "2.4.0" },
+        serverInfo: { name: "opencode-agent", version: "3.0.0" },
         instructions: SERVER_INSTRUCTIONS,
       },
     });
@@ -1490,25 +1720,36 @@ async function handle(msg) {
     clientReady = true;
     return;
   }
+  // the client gave up on a call (the user interrupted, or its own limit ran out): a wait must not answer it,
+  // or the reply it carries would count as delivered without anyone having read it
+  if (method === "notifications/cancelled") {
+    if (params?.requestId !== undefined) cancelledCalls.add(params.requestId);
+    return;
+  }
   if (method === "tools/list") {
     // first run in this folder: wait (bounded) for the live list; otherwise the cache answers at once
     if (!catalog && refreshing) await Promise.race([refreshing, new Promise((r) => setTimeout(r, 10000))]);
-    return send({ jsonrpc: "2.0", id, result: { tools: [buildTool(), RESULT_TOOL, CANCEL_TOOL, LIST_TOOL] } });
+    return send({ jsonrpc: "2.0", id, result: { tools: [buildTool(), resultTool(), CANCEL_TOOL, LIST_TOOL] } });
   }
   if (method === "tools/call") {
     const reply = (text, isError = false) => send({ jsonrpc: "2.0", id, result: { content: [{ type: "text", text }], isError } });
     const a = params?.arguments || {};
     if (params?.name === "opencode_run") {
       if (!a.prompt) return reply("prompt is required", true);
+      if (!ALLOW_ANY) {
+        const refused = useWorker(a);
+        if (refused) return reply(refused, true);
+      }
       const bad = await validate(a);
-      if (bad) return reply(bad, true);
+      if (bad) return reply(a._w ? `worker "${a._w.name}": ${bad}` : bad, true);
       const waiting = inUse("all") >= MAX_CONCURRENT ? ` (queued: ${MAX_CONCURRENT} jobs already running on this machine)` : "";
       const job = startJob(a);
       const s = jobs.get(job).state;
-      const on = a.model || a.effort ? ` on ${a.model || resolveModel(a)}${a.effort ? `#${a.effort}` : ""}` : "";
-      return reply(`started ${job}${on}${waiting}, limit ${s.timeoutMs / 1000}s, idle ${s.idleMs / 1000}s. Nothing notifies you when it ends: wait for it with opencode_result { job: "${job}" } (or several ids at once as \`jobs\`), repeated until it is done.`);
+      const model = `${a.model || resolveModel(a)}${a.effort ? `#${a.effort}` : ""}`;
+      const on = a._w ? ` on worker ${a._w.name} (${model})` : a.model || a.effort ? ` on ${model}` : "";
+      return reply(`started ${job}${on}${waiting}, limit ${s.timeoutMs / 1000}s, idle ${s.idleMs / 1000}s. Wait for it with one call: opencode_result { job: "${job}" } (or several ids at once as \`jobs\`); it returns when the job ends.`);
     }
-    if (params?.name === RESULT_TOOL.name) {
+    if (params?.name === "opencode_result") {
       const ids = [...new Set([...(Array.isArray(a.jobs) ? a.jobs : []), ...(a.job ? [a.job] : [])].map(String))];
       if (!ids.length) return reply("pass `job` or `jobs`", true);
       const pending = (s) => s.status === "running" || s.status === "queued";
@@ -1519,13 +1760,27 @@ async function handle(msg) {
       const fresh = (jid) => ids.length === 1 || !delivered.has(jid);
       const ready = () => ids.some((jid) => found.get(jid) && !pending(found.get(jid).state) && fresh(jid));
       const anyPending = () => ids.some((jid) => found.get(jid) && pending(found.get(jid).state));
-      const until = Date.now() + Math.max(0, Math.min(55, Number(a.wait_seconds ?? 50) || 0)) * 1000;
+      const most = waitLimit();
+      const asked = Number(a.wait_seconds);
+      const until = Date.now() + Math.max(0, Math.min(most, a.wait_seconds === undefined || !Number.isFinite(asked) ? most : asked)) * 1000;
+      // a progress message now and then: the caller's user sees what the jobs are doing, and a client that ends a
+      // silent call (Claude Code: after 30 minutes) sees that this one is alive
+      const token = params?._meta?.progressToken;
+      let told = Date.now();
+      let beat = 0;
       while (!ready() && anyPending() && Date.now() < until) {
+        if (cancelledCalls.delete(id)) return; // the client gave up on this call: no answer, nothing counted as delivered
+        if (token !== undefined && Date.now() - told >= PROGRESS_MS) {
+          told = Date.now();
+          const running = ids.map((jid) => found.get(jid)?.state).filter((s) => s && pending(s));
+          send({ jsonrpc: "2.0", method: "notifications/progress", params: { progressToken: token, progress: ++beat, message: running.map(progressShort).join(" | ").slice(0, 300) } });
+        }
         // only jobs still pending: a settled promise would end the race at once, every time
         const mine = ids.filter((jid) => found.get(jid) && pending(found.get(jid).state)).map((jid) => found.get(jid).job?.promise).filter(Boolean);
-        await Promise.race([...mine, sleep(Math.min(2000, Math.max(0, until - Date.now())))]);
+        await Promise.race([...mine, sleep(Math.min(2000, PROGRESS_MS, Math.max(0, until - Date.now())))]);
         found = look();
       }
+      if (cancelledCalls.delete(id)) return;
       if (ids.length === 1) {
         const s = found.get(ids[0]).state;
         if (pending(s)) return reply(progressOne(s));
@@ -1537,7 +1792,7 @@ async function handle(msg) {
         const f = found.get(jid);
         if (!f) lines.push(`${jid}: unknown`);
         else if (pending(f.state)) lines.push(progress(f.state));
-        else if (!fresh(jid)) lines.push(`${jid}: ${f.state.status}, reply already returned`);
+        else if (!fresh(jid)) lines.push(`${jid}: ${f.state.status}, reply already returned (opencode_result { job: "${jid}" } returns it again)`);
         else {
           delivered.add(jid);
           parts.push(`## ${jid} · ${f.state.status}\n${f.state.reply || f.state.status}`);
@@ -1568,8 +1823,10 @@ if (process.env.OPENCODE_BRIDGE_NO_MAIN !== "1") {
 
   // read the live catalog now; with a cached one, tools/list doesn't wait for it
   refreshCatalog();
-  if (CLAUDE_EXE)
-    watchFile(WORKERS_FILE, { interval: 3000, persistent: false }, () => {
+  setTimeout(pruneFiles, 5000).unref();
+  // the worker list is the tool's description: tell the client when the user changes it
+  for (const file of [WORKERS_FILE, LEGACY_WORKERS_FILE])
+    watchFile(file, { interval: 3000, persistent: false }, () => {
       if (clientReady) send({ jsonrpc: "2.0", method: "notifications/tools/list_changed" });
     });
 

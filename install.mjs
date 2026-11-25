@@ -100,7 +100,10 @@ editJson(ocConfig, (c) => {
       { action: "subagent", resource: "*", effect: "deny" },
       { action: "edit", resource: "*", effect: "ask" },
       { action: "shell", resource: "*", effect: "ask" },
-      ...["git status*", "git diff*", "git log*", "git show*", "cargo check*", "cargo clippy*", "cargo test*"].map(shell),
+      // `cargo clippy --fix` rewrites files, so clippy is not on the list of commands a read-only job may run
+      ...["git status*", "git diff*", "git log*", "git show*", "cargo check*", "cargo test*"].map(shell),
+      // the last matching rule wins: a worker never pushes, whatever an edit job approves
+      { action: "shell", resource: "git push*", effect: "deny" },
     ],
   };
   delete c.agents["deepseek-flash-ro"]; // the old read-only twin, no longer needed

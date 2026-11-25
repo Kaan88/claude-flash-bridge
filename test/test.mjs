@@ -132,6 +132,7 @@ class Server {
   constructor(name, env = {}) {
     this.next = 1;
     this.waiting = new Map();
+    this.notes = []; // notifications from the server
     this.child = spawn(process.execPath, [serverFile], {
       stdio: ["pipe", "pipe", "inherit"],
       env: {
@@ -145,6 +146,9 @@ class Server {
         OPENCODE_BRIDGE_NO_MAIN: "",
         OPENCODE_CLAUDE: "0",
         OPENCODE_PROBE_MS: "500",
+        OPENCODE_ALLOW_ANY: "1",
+        BRIDGE_WORKERS_FILE: join(root, "no-workers.json"),
+        CLAUDE_WORKERS_FILE: join(root, "no-claude-workers.json"),
         ...env,
       },
     });
@@ -156,6 +160,7 @@ class Server {
       for (const l of lines) {
         const m = JSON.parse(l);
         if (m.id !== undefined && this.waiting.has(m.id)) this.waiting.get(m.id)(m);
+        else if (m.id === undefined) this.notes.push(m);
       }
     });
   }
@@ -166,8 +171,8 @@ class Server {
       this.child.stdin.write(JSON.stringify({ jsonrpc: "2.0", id, method, params }) + "\n");
     });
   }
-  async start() {
-    const init = await this.rpc("initialize", { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "test", version: "0" } });
+  async start(client = "test") {
+    const init = await this.rpc("initialize", { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: client, version: "0" } });
     this.child.stdin.write(JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" }) + "\n");
     return init.result;
   }
@@ -345,7 +350,7 @@ await test("opencode_list shows every session's jobs, and any of them can be can
 
   // its place is free: the job that waited now runs
   assert.match((await b.result(waits)).text, /^PONG/);
-  assert.match((await a.call("opencode_list")).text, /^No job is queued or running\.\n\nPlaces:\nthe machine: 0\/1 places held\n\nSessions still busy without a job: none\.$/);
+  assert.match((await a.call("opencode_list")).text, /^No job is queued or running\.\n\nPlaces:\nthe machine: 0\/1 places held\n\nSessions still busy without a job: none\.\n\nWorkers: any OpenCode agent or model \(OPENCODE_ALLOW_ANY\)\n\nThis server: client "test", one opencode_result call waits up to 150 s\.$/);
 });
 
 await test("a job whose server died is listed as gone, and cancelling it frees its place", async () => {
@@ -415,6 +420,101 @@ await test("the blocklist file switches a model off and on while the server runs
   assert.match((await live.result(await ask())).text, /^PONG/, "cleared");
 });
 live.stop();
+
+// ---- the worker list: the only things a caller can run ----
+
+const workersFile = join(root, "workers.json");
+writeFileSync(
+  workersFile,
+  JSON.stringify({
+    default: "flash",
+    workers: {
+      flash: { runs: "opencode", agent: "deepseek-flash", description: "Cheap worker." },
+      ro: { runs: "opencode", agent: "deepseek-flash", readOnly: true },
+      ghost: { runs: "opencode", agent: "no-such-agent" },
+      off: { runs: "opencode", agent: "deepseek-flash", disabled: true },
+      cc: { runs: "claude", model: "sonnet" },
+    },
+  }),
+);
+const listed = new Server("state-workers", { OPENCODE_ALLOW_ANY: "", BRIDGE_WORKERS_FILE: workersFile, OPENCODE_PROGRESS_MS: "300" });
+const started = (text) => /started (job_[a-z0-9]+_\d+)/.exec(text)[1];
+await test("with a worker list the tool offers the workers and nothing else", async () => {
+  await listed.start("claude-code");
+  const { tools } = (await listed.rpc("tools/list", {})).result;
+  const props = tools[0].inputSchema.properties;
+  assert.deepEqual(props.worker.enum, ["flash", "ro", "ghost", "cc"]);
+  assert.equal("model" in props || "agent" in props, false, "no model or agent to choose");
+  assert.match(props.worker.description, /^flash \(OpenCode agent deepseek-flash on fake\/model, not the Claude plan, efforts low,high, the default\): Cheap worker\.$/m);
+  assert.match(props.worker.description, /^cc \(Claude Code sonnet, uses the Claude plan\)$/m);
+  assert.doesNotMatch(JSON.stringify(tools), /Models \(provider\/id/, "no model catalog");
+  for (const t of tools) assert.ok(t.description.length < 2048, `${t.name}: ${t.description.length}`);
+  assert.match(tools[1].description, /up to 1500 s/, "Claude Code gets the long wait");
+});
+await test("a call runs the default worker, a named one, or is refused: no other agent or model gets through", async () => {
+  const first = await listed.call("opencode_run", { prompt: "FAKE:quick" });
+  assert.match(first.text, /^started job_\w+ on worker flash \(fake\/model\)/);
+  assert.match((await listed.result(started(first.text))).text, /^PONG/);
+  const old = await listed.call("opencode_run", { prompt: "FAKE:quick", agent: "flash" });
+  assert.match(old.text, /on worker flash/, "an older call may name a worker with agent");
+  await listed.result(started(old.text));
+  const refused = async (args, re) => {
+    const r = await listed.call("opencode_run", { prompt: "FAKE:quick", ...args });
+    assert.equal(r.isError, true, JSON.stringify(args));
+    assert.match(r.text, re, JSON.stringify(args));
+  };
+  await refused({ model: "fake/model" }, /^model "fake\/model" is not a worker\..* Workers: flash, ro, ghost, cc$/);
+  await refused({ agent: "deepseek-flash" }, /^agent "deepseek-flash" is not a worker\./);
+  await refused({ model: "claude-code/opus" }, /is not a worker/);
+  await refused({ worker: "nope" }, /^unknown worker "nope"\. Workers: flash, ro, ghost, cc$/);
+  await refused({ worker: "off" }, /^unknown worker "off"/);
+  await refused({ worker: "flash", model: "fake/model" }, /`model` is not accepted/);
+  await refused({ worker: "ro", allow_edits: true }, /^worker "ro" is read-only/);
+  await refused({ worker: "ghost" }, /^worker "ghost": unknown agent "no-such-agent"/);
+  await refused({ worker: "flash", effort: "max" }, /^worker "flash": fake\/model has effort levels low, high/);
+  await refused({ worker: "flash", session: "0f8fad5b-d9cb-469f-a165-70867728950e" }, /is a Claude Code session and worker "flash" runs OpenCode/);
+});
+await test("a continued session goes back to the worker that started it", async () => {
+  const r = await listed.result(await listed.run({ prompt: "FAKE:quick", worker: "ro" }));
+  const again = await listed.call("opencode_run", { prompt: "FAKE:quick", session: fakeSession(r.text) });
+  assert.match(again.text, /on worker ro /, again.text);
+  await listed.result(started(again.text));
+});
+await test("a wait the client gave up on answers nothing and keeps the reply for the next call", async () => {
+  const job = await listed.run({ prompt: "FAKE:hang:1500" });
+  const other = await listed.run({ prompt: "FAKE:hang:1500" });
+  const id = listed.next++;
+  let answered = false;
+  listed.waiting.set(id, () => (answered = true));
+  listed.child.stdin.write(JSON.stringify({ jsonrpc: "2.0", id, method: "tools/call", params: { name: "opencode_result", arguments: { jobs: [job, other] }, _meta: { progressToken: "p1" } } }) + "\n");
+  await until("a progress message", () => listed.notes.some((n) => n.method === "notifications/progress" && n.params.progressToken === "p1" && n.params.message.includes(job)));
+  listed.child.stdin.write(JSON.stringify({ jsonrpc: "2.0", method: "notifications/cancelled", params: { requestId: id } }) + "\n");
+  await sleep(3500);
+  assert.equal(answered, false, "no answer to a cancelled call");
+  const r = await listed.call("opencode_result", { jobs: [job, other] });
+  assert.match(r.text, new RegExp(`## ${job} · done\\nwoke up`), r.text);
+  assert.match(r.text, /All done\.$/);
+  const second = (await listed.call("opencode_result", { jobs: [job, other] })).text;
+  assert.ok(second.includes(`${job}: done, reply already returned (opencode_result { job: "${job}" } returns it again)`), second);
+});
+await test("opencode_list names the workers and how long a wait may be", async () => {
+  const list = (await listed.call("opencode_list")).text;
+  assert.match(list, /^Workers:\nflash \(OpenCode agent deepseek-flash/m);
+  assert.match(list, /This server: client "claude-code", one opencode_result call waits up to 1500 s\.$/);
+});
+listed.stop();
+
+await test("the wait limit follows the client, and a worker entry is read strictly", () => {
+  assert.equal(bridge.waitLimit({ env: NaN, client: "claude-code", toolTimeoutMs: NaN }), 1500);
+  assert.equal(bridge.waitLimit({ env: NaN, client: "claude-code", toolTimeoutMs: 300000 }), 240, "a minute under the client's own limit");
+  assert.equal(bridge.waitLimit({ env: NaN, client: "claude-ai", toolTimeoutMs: NaN }), 150, "a client that cuts calls short");
+  assert.equal(bridge.waitLimit({ env: 600, client: "claude-ai", toolTimeoutMs: NaN }), 600, "OPENCODE_WAIT_SECONDS decides");
+  assert.equal(bridge.readWorker("x", { runs: "opencode" }), null, "an OpenCode worker needs an agent");
+  assert.equal(bridge.readWorker("bad name", { runs: "claude", model: "opus" }), null);
+  assert.equal(bridge.readWorker("x", { model: "opus" }), null, "no runs: not a worker of the new list");
+  assert.deepEqual(bridge.readWorker("x", { model: "opus", effort: "high" }, true), { name: "x", runs: "claude", readOnly: false, description: "", model: "opus", effort: "high", instructions: "" });
+  assert.deepEqual(bridge.readWorker("y", { runs: "opencode", agent: "a", model: "p/m#high" }), { name: "y", runs: "opencode", readOnly: false, description: "", agent: "a", model: "p/m", effort: "" });
+});
 
 for (const pid of strays) {
   try {

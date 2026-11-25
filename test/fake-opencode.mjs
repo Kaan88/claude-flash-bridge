@@ -45,7 +45,7 @@ async function main() {
         ],
       });
     if (op === "agent.list")
-      return out({ data: [{ id: "deepseek-flash", mode: "primary", description: "Fake agent.", model: { providerID: "fake", id: "model" }, permissions: [{ action: "edit", resource: "*", effect: "ask" }] }] });
+      return out({ data: [{ id: "deepseek-flash", mode: "primary", description: "Fake agent.", model: { providerID: "fake", id: "model" }, permissions: [{ action: "edit", resource: "*", effect: "ask" }, { action: "shell", resource: "*", effect: "ask" }] }] });
     if (op === "model.default") return out({ data: { providerID: "fake", id: "model" } });
     if (op === "session.active") return out({ data: Object.fromEntries(readdirSync(join(dir, "active")).map((s) => [s, { type: "running" }])) });
     if (op === "session.interrupt") {

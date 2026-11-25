@@ -1,38 +1,83 @@
 # OpenCode bridge for Claude Code
 
-A small MCP server (no dependencies, one file) that lets Claude hand work to a DeepSeek Flash agent
-running in [OpenCode](https://opencode.ai). Claude plans and reviews; Flash does the hands-on
-coding on DeepSeek's API, which doesn't count against your Claude usage limits.
+A small MCP server (no dependencies, one file) that lets Claude hand work to **workers**: other models working on
+their own. A worker runs either an agent in [OpenCode](https://opencode.ai) (DeepSeek Flash by default, on DeepSeek's
+API, which doesn't count against your Claude usage limits) or Claude Code itself in the background (which does).
+Claude plans and reviews; the workers do the hands-on work.
+
+## What does what
+
+| Piece | What it is |
+|---|---|
+| **OpenCode** | A separate coding agent with its own models, agents and plugins. Its configuration is its own. |
+| **Workers** | The list of what Claude may run, in `~/.config/opencode-bridge/workers.json`. Each worker runs one OpenCode agent, or Claude Code itself. |
+| **The bridge** | This server. Claude asks it for a worker by name. Anything that is not on the list is refused: no other OpenCode agent or model can be reached. |
+
+[OpenCode Config Studio](https://github.com/Kaan88/opencode-config-studio) edits all of it: OpenCode's models and
+agents, the worker list, and it installs and updates this bridge.
 
 ## Tools
 
 | Tool | What it does |
 |---|---|
-| `opencode_run` | Starts a job and returns **at once** with a job id (`job_k3x_2`). Inputs: `prompt`, `directory`, `allow_edits`, `session`, `model` (any OpenCode model, `provider/id`), `effort` (that model's own levels), `files`, `agent`, `timeout_seconds`, `idle_seconds`, `tool_idle_seconds`. |
-| `opencode_result` | `{ job }` or `{ jobs: [...] }`, plus `wait_seconds?`. Waits up to 55 s for the job, or for **any** of the jobs, then returns each finished reply (ending in `session: ses_…`) and one progress line per job still running (elapsed time, last output, last tool, the tool call in flight, files edited, why it is queued). With `jobs`, each reply is returned once; repeat the call until it says all are done. |
+| `opencode_run` | Starts a job on a worker and returns **at once** with a job id (`job_k3x_2`). Inputs: `prompt`, `worker` (one of the listed names; the default worker when left out), `directory`, `allow_edits`, `session`, `effort` (one of that worker's model's levels), `files`, `timeout_seconds`, `idle_seconds`, `tool_idle_seconds`. |
+| `opencode_result` | `{ job }` or `{ jobs: [...] }`, plus `wait_seconds?`. **One call waits** for the job, or for **any** of the jobs (up to 25 minutes in Claude Code, see "Waiting"), then returns each finished reply (ending in `session: ses_…`) and one progress line per job still running (elapsed time, last output, last tool, the tool call in flight, files edited, why it is queued). With `jobs`, each reply is returned once; call again only while it says jobs are still running. |
 | `opencode_cancel` | `{ job }`. Stops a queued or running job of **any** session: kills its process tree and interrupts its OpenCode session, so builds and tests it started stop too. The reply's `resume:` line says whether the session is idle or still busy. On a job that already timed out or failed it interrupts a session that is still busy. Edits stay on disk; the session can be continued. |
-| `opencode_list` | No input. Every queued and running job on the machine, from all sessions: id, state, model, owner process (alive or gone), start time, running time, last tool, last output, the tool call in flight, queue place; then who holds the places of each pool, and the sessions an ended job left busy in OpenCode. |
+| `opencode_list` | No input. The workers, how long a wait may be, and every queued and running job on the machine, from all sessions: id, state, model, owner process (alive or gone), start time, running time, last tool, last output, the tool call in flight, queue place; then who holds the places of each pool, and the sessions an ended job left busy in OpenCode. |
 
-### Models, effort levels and agents (read live)
+### Workers
 
-When the server starts it asks OpenCode for its models and agents (`opencode api model.list` / `agent.list`,
-about a third of a second) and writes them into the `opencode_run` tool description in a compact form,
-grouped by provider and effort levels, e.g. `anthropic: [low-max] claude-opus-5-5{,-fast} ...`
-(about 500 tokens for ~30 models; Claude Code loads the schema only when the tool is used). The levels are each model's
-real OpenCode variants, so `effort` is checked per model and a wrong level or unknown model is refused with the valid
-choices. The list:
+```json
+{
+  "default": "deepseek-flash",
+  "workers": {
+    "deepseek-flash": { "runs": "opencode", "agent": "deepseek-flash", "effort": "high", "description": "Default implementer." },
+    "astra": { "runs": "opencode", "agent": "deepseek-flash", "model": "openai/gpt-6.2-astra", "description": "A stronger model for hard tasks." },
+    "cc-reviewer": { "runs": "claude", "model": "opus", "effort": "high", "readOnly": true,
+      "description": "Reviews code for correctness bugs.", "instructions": "Report correctness bugs only, file:line first." }
+  }
+}
+```
 
-- leaves out OpenCode's own free models (provider `opencode`, `-free` or zero cost; `OPENCODE_INCLUDE_FREE=1` keeps them).
-  Zero cost alone isn't "free": subscription and local providers report $0 and stay listed;
-- shows only the newest version of each model line (`claude-opus-5-5` hides `claude-opus-5`, `4-8`, ...;
-  `gpt-6.2-sol` hides `gpt-6.1-sol`); `OPENCODE_KEEP_OLD_MODELS=1` lists them all. Older ones can still be passed by name;
-- keeps every local model (localhost / private-network base URL), marked `(local)`, or `(local, OFFLINE at startup)`
-  when its server didn't answer a 1.5 s probe;
-- lists the visible agents with the model each runs on.
+- `runs: "opencode"` needs an `agent` (its instructions and permissions apply; it may be hidden in OpenCode, which
+  suits an agent made only for a worker) and may name a `model` (`provider/id`)
+  to run that agent on, and a usual `effort`.
+- `runs: "claude"` runs Claude Code's own CLI: `model` is fable, opus, sonnet or haiku, `effort` the usual level,
+  `instructions` are appended to its system prompt.
+- `readOnly` workers are refused for edit jobs, `disabled: true` hides one, `description` is what Claude reads when
+  it chooses. `default` runs when a call names no worker; without it, the first OpenCode worker does.
 
-The result is cached per project folder in the state folder, so a restart answers at once; when the live list differs,
-the server sends `tools/list_changed` and Claude re-reads it. An unknown model triggers one live re-read before it's refused.
-Passing `effort` without `model` now applies it to the chosen agent's own model (it used to always apply to `OPENCODE_MODEL`).
+The tool's `worker` parameter lists exactly these names, each with what runs it and whether it uses the Claude plan,
+so "ask cc-reviewer to check src/" is enough. There is no `model` or `agent` parameter: a call that names one is
+refused with the list of workers. A continued `session` goes back to the worker that started it. The bridge re-reads
+the file when it changes and tells Claude to refresh its tool list, so no restart is needed.
+
+While `workers.json` does not exist, the list is the default OpenCode agent (`OPENCODE_AGENT`, `deepseek-flash`) plus
+the workers of the older `~/.claude/claude-workers.json`, so an install from before the list keeps working. Calls
+written for older versions that name a worker with `agent` still run; `model: "claude-code/opus"` and other models no
+longer do. `OPENCODE_ALLOW_ANY=1` brings the old behaviour back: every OpenCode model and agent is listed and can be
+asked for with `model` and `agent`.
+
+For an OpenCode worker the bridge reads the agent's model and its effort levels from OpenCode
+(`opencode api model.list` / `agent.list`, cached per project folder), so `effort` is checked per model and a wrong
+level is refused with the valid ones. `OPENCODE_MODEL_EXCLUDE` and the blocklist file still switch a model off for
+every worker that would run on it.
+
+### Waiting
+
+A wait is one tool call, and a tool call that is waiting costs nothing. A poll every 55 seconds, which is what this
+bridge asked for before, costs one model request each time, with the whole conversation read again. So
+`opencode_result` now waits until a job ends:
+
+- in Claude Code up to 25 minutes per call (a minute under `MCP_TOOL_TIMEOUT` when that is shorter). Claude Code moves
+  a call that runs longer than two minutes to the background and tells the session when it settles, so Claude can go
+  on with other work, or end its turn, meanwhile;
+- in other clients 150 seconds, because they cut a tool call short (Claude Desktop's chat: 180 s by default);
+- `OPENCODE_WAIT_SECONDS` sets it for every client; `wait_seconds: 0` in a call only looks.
+
+While it waits it sends a progress message every 20 seconds to a client that asked for progress. A call the client
+gave up on (the user interrupted it, or its own limit ran out) is not answered, so a reply is never counted as
+delivered without having been read; the next call returns it.
 
 The call returns at once so that a long job can never hit a tool-call timeout (it used to, and lost the reply
 while the edits landed anyway). At most 10 jobs run at once on the machine, across every Claude session (`OPENCODE_MAX_CONCURRENT`), and at most 6 on any one
@@ -74,43 +119,26 @@ time, the longest silent stretch and the last tool, e.g.
 `<job>.jsonl` (the raw event stream), plus `<job>.cancel` while a cancel from another copy is pending. Any copy can report on, list or cancel any job; ids carry the server's pid, so two
 copies never hand out the same one. If the server that ran a job exits, the job is reported as `lost` (with its
 session and edited files) instead of "unknown"; when a session closes, its server stops its running jobs.
-Finished jobs are kept in memory for 24 hours, and their files stay in the state folder.
+Finished jobs are kept in memory for 24 hours; their files are deleted after 3 days (`OPENCODE_KEEP_DAYS`, 0 keeps them).
 
 The `deepseek-flash` agent's edits and shell commands are set to **ask**. Without `allow_edits` a job runs without
 `--auto`, and OpenCode rejects every ask when nobody can answer it, so the agent can read files and run the allowed
 read-only commands (git status/diff/log/show, cargo check/clippy/test) but can't change anything. With `allow_edits` the job
 runs with `--auto`, which approves them. The same holds for any agent whose edits are "ask" or "deny"; an agent that edits
-freely is refused for read-only jobs (use `model` to pick a model instead). An older install's `deepseek-flash-ro` twin is
+or runs shell commands freely is refused for read-only jobs. An older install's `deepseek-flash-ro` twin is
 still used while it exists; the installer removes it.
 
-## Claude Code as a worker
+## Claude Code workers
 
-`model: "claude-code/fable"` (or `opus`, `sonnet`, `haiku`) runs Claude Code's own CLI (`claude -p`) instead of OpenCode,
-through the same jobs: `opencode_result` (one job or several), `opencode_cancel`, the shared limits, and `session` to continue.
-`effort` takes low, medium, high, xhigh or max.
+A worker with `runs: "claude"` runs Claude Code's own CLI (`claude -p`) through the same jobs: `opencode_result`,
+`opencode_cancel`, the shared limits, and `session` to continue.
 
 - It runs on your Claude plan with Claude Code's full toolset and your CLAUDE.md files, but loads no MCP servers
   (`--strict-mcp-config`), so a worker can't start this bridge again.
 - Read-only jobs run in "don't ask" mode, allowed only to read, search, fetch web pages and run git status/diff/log/show;
   anything else is denied. Edit jobs run in Claude's `auto` permission mode, where Claude's own safety check approves actions.
 - The calling session's `CLAUDE_*` environment variables are not passed on, so the worker is a separate session.
-- Its session ids are UUIDs (OpenCode's start with `ses_`), so passing `session` alone picks the right worker.
-- `agent` doesn't apply. Set `OPENCODE_CLAUDE=0` to hide these models, or `CLAUDE_EXE` when `claude` isn't found.
-
-### Named workers
-
-Define workers in `~/.claude/claude-workers.json` (or `CLAUDE_WORKERS_FILE`), most easily on OpenCode Config Studio's
-**Claude workers** page:
-
-```json
-{ "workers": { "cc-reviewer": { "model": "opus", "effort": "high", "readOnly": true,
-  "description": "Reviews code for correctness bugs.", "instructions": "Report correctness bugs only, file:line first." } } }
-```
-
-They're listed in the tool description by name, so "ask cc-reviewer to check src/" is enough: Claude passes the name as
-`agent`. `model` is fable, opus, sonnet or haiku; `effort` is the default (a job may override it); `readOnly` workers are
-refused for edit jobs; `instructions` are appended to the worker's system prompt; `disabled: true` hides one. The bridge
-re-reads the file when it changes and tells Claude to refresh its tool list, so no restart is needed.
+- Set `OPENCODE_CLAUDE=0` to switch these workers off, or `CLAUDE_EXE` when `claude` isn't found.
 
 ## Install or update in one step
 
@@ -177,14 +205,19 @@ Each session runs its own copy of the server. After changing `server.mjs`: in a 
 | `OPENCODE_PROBE_MS` | 30000 | how often a silent OpenCode job is asked which tool call is running |
 | `OPENCODE_MAX_CONCURRENT` | 10 | jobs running at once on this machine, all sessions together |
 | `OPENCODE_LOCAL_CONCURRENT` | 6 | jobs running at once on one local model |
-| `CLAUDE_EXE` | found on PATH or in `~/.local/bin` | Claude Code CLI for `claude-code/*` jobs |
-| `OPENCODE_CLAUDE` | on | `0` hides the `claude-code/*` models |
+| `CLAUDE_EXE` | found on PATH or in `~/.local/bin` | Claude Code CLI for workers that run Claude Code |
+| `OPENCODE_CLAUDE` | on | `0` switches off the workers that run Claude Code |
 | `OPENCODE_MAX_REPLY_CHARS` | 20000 | cap on any reply |
 | `OPENCODE_INCLUDE_FREE` | off | `1` lists OpenCode's own free models too |
 | `OPENCODE_KEEP_OLD_MODELS` | off | `1` lists older versions of each model line too |
 | `OPENCODE_MODEL_EXCLUDE` | none | regex on `provider/id`: those models are left out of the tool description **and refused** when a job asks for them (by name, by alias or through an agent's own model), e.g. `deepseek-v4-pro` or `-(flex|ultrafast)$`. Fixed at start; for a switch you can flip while sessions run, use the blocklist file below |
 | `OPENCODE_BLOCKLIST` | `~/.config/opencode-bridge/blocked-models.json` | `{"blocked": ["deepseek/deepseek-v4-pro"]}`: exact `provider/id` names, refused like the regex above but read again on every call, so editing the file takes effect at once in every running session, with no restart. A missing or broken file blocks nothing |
 | `OPENCODE_STATE_DIR` | `<tmp>/opencode-agent` | job state and raw logs, shared by every server copy |
+| `OPENCODE_KEEP_DAYS` | 3 | job files older than this are deleted when a server starts; 0 keeps them all |
+| `BRIDGE_WORKERS_FILE` | `~/.config/opencode-bridge/workers.json` | the worker list |
+| `CLAUDE_WORKERS_FILE` | `~/.claude/claude-workers.json` | the older Claude workers file, read only while the worker list does not exist |
+| `OPENCODE_WAIT_SECONDS` | 1500 in Claude Code, 150 elsewhere | how long one `opencode_result` call may wait |
+| `OPENCODE_ALLOW_ANY` | off | `1`: no worker list; any OpenCode agent or model can be asked for with `agent` and `model`, as before 3.0 |
 
 ## Tests
 
@@ -194,5 +227,5 @@ for the `opencode` executable, so no model is called.
 
 ## The working-mode prompt
 
-[WORKING-MODE.md](WORKING-MODE.md) is the prompt to paste into a Claude session so it routes work to Flash,
-Haiku and Sonnet and keeps its own (Opus) tokens for planning and review.
+[WORKING-MODE.md](WORKING-MODE.md) is the prompt to paste into a Claude session (or a CLAUDE.md) so it routes work to the
+workers, waits with one call and keeps its own tokens for planning and review.
