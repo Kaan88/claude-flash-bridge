@@ -3,7 +3,7 @@
 // Part 2 drives the real server over MCP stdio against test/fake-opencode.mjs, so no model is called.
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { copyFileSync, existsSync, linkSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync } from "node:fs";
+import { copyFileSync, existsSync, linkSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { delimiter, dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -382,6 +382,39 @@ await test("an agent whose own model is switched off is refused too", async () =
   assert.match(r.text, /model "fake\/model" is switched off/);
 });
 hiddenAgent.stop();
+
+const blockFile = join(root, "blocked-models.json");
+const live = new Server("state-blocklist", { OPENCODE_BLOCKLIST: blockFile });
+await test("the blocklist file switches a model off and on while the server runs, no restart", async () => {
+  await live.start();
+  const ask = () => live.run({ prompt: "FAKE:quick", model: "fake/model" });
+  const put = async (x) => {
+    writeFileSync(blockFile, x);
+    await sleep(30);
+  };
+  // no file: nothing is blocked
+  assert.match((await live.result(await live.run({ prompt: "FAKE:quick", model: "fake/model" }))).text, /^PONG/);
+  // block it: refused at once, with the reason, by name, another case and an effort; an agent default is refused too
+  await put(JSON.stringify({ blocked: ["Fake/Model"] }));
+  for (const model of ["fake/model", "FAKE/MODEL", "fake/model#high"]) {
+    const r = await live.call("opencode_run", { prompt: "FAKE:quick", model });
+    assert.equal(r.isError, true, model);
+    assert.match(r.text, /model "fake\/model" is switched off on this machine \(the blocklist\)/i, `${model}: ${r.text}`);
+  }
+  const byDefault = await live.call("opencode_run", { prompt: "FAKE:quick" });
+  assert.equal(byDefault.isError, true, "the default model is fake/model here: refused too");
+  // a broken file blocks nothing, a file without the entry blocks nothing
+  await put("{ not json");
+  assert.match((await live.result(await ask())).text, /^PONG/, "broken file");
+  await put(JSON.stringify({ blocked: ["other/thing"] }));
+  assert.match((await live.result(await ask())).text, /^PONG/, "other entry");
+  // block again, then clear the list
+  await put(JSON.stringify({ blocked: ["fake/model"] }));
+  assert.equal((await live.call("opencode_run", { prompt: "FAKE:quick", model: "fake/model" })).isError, true);
+  await put(JSON.stringify({ blocked: [] }));
+  assert.match((await live.result(await ask())).text, /^PONG/, "cleared");
+});
+live.stop();
 
 for (const pid of strays) {
   try {

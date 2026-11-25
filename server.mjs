@@ -304,6 +304,40 @@ const INCLUDE_FREE = process.env.OPENCODE_INCLUDE_FREE === "1";
 // It also refuses a job that asks for such a model, by name, by alias or through an agent's own model: hiding a model
 // from the description alone does not stop a caller that names it.
 const EXCLUDE_RE = process.env.OPENCODE_MODEL_EXCLUDE ? new RegExp(process.env.OPENCODE_MODEL_EXCLUDE, "i") : null;
+// The same switch, but changeable while the server runs: a JSON file {"blocked": ["provider/id", ...]} read again whenever
+// it changes (checked on every call, no restart). Exact "provider/id" names, any case. A missing or unreadable file blocks nothing.
+const BLOCK_FILE = process.env.OPENCODE_BLOCKLIST || join(homedir(), ".config", "opencode-bridge", "blocked-models.json");
+let blockMtime = -1;
+let blocked = new Set();
+function blockedRefs() {
+  let m = 0;
+  try {
+    m = statSync(BLOCK_FILE).mtimeMs;
+  } catch {
+    m = 0;
+  }
+  if (m !== blockMtime) {
+    blockMtime = m;
+    blocked = new Set();
+    if (m) {
+      try {
+        const list = JSON.parse(readFileSync(BLOCK_FILE, "utf8")).blocked;
+        if (Array.isArray(list)) blocked = new Set(list.filter((x) => typeof x === "string").map((x) => x.trim().toLowerCase()));
+      } catch {
+        // half-written or broken: keep nothing blocked rather than guess
+      }
+    }
+  }
+  return blocked;
+}
+// Why a model is switched off: "OPENCODE_MODEL_EXCLUDE", "the blocklist", or "" when it is not.
+function offReason(ref) {
+  const r = String(ref || "");
+  if (!r) return "";
+  if (EXCLUDE_RE?.test(r)) return "OPENCODE_MODEL_EXCLUDE";
+  if (blockedRefs().has(r.toLowerCase())) return "the blocklist";
+  return "";
+}
 const CATALOG_FILE = join(STATE_DIR, `catalog-${createHash("sha1").update(process.cwd().toLowerCase()).digest("hex").slice(0, 10)}.json`);
 const LOCAL_HOST = /^(localhost|127\.|10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.|\[?::1\]?$|[^.]+$|.*\.local$)/i;
 
@@ -442,7 +476,7 @@ function latestOnly(models) {
 
 const allModels = () => [...(catalog?.models || []), ...CLAUDE_MODELS];
 const shownModels = () => {
-  const list = allModels().filter((m) => (INCLUDE_FREE || !m.free) && !(EXCLUDE_RE && EXCLUDE_RE.test(m.ref)));
+  const list = allModels().filter((m) => (INCLUDE_FREE || !m.free) && !offReason(m.ref));
   return KEEP_OLD ? list : latestOnly(list);
 };
 const findModel = (ref) => allModels().find((m) => m.ref.toLowerCase() === String(ref).toLowerCase());
@@ -524,12 +558,12 @@ function resolveModel(args) {
   return name === DEFAULT_AGENT || name === READONLY_AGENT ? MODEL : catalog?.defaultModel || MODEL;
 }
 
-// The refusal for a model that OPENCODE_MODEL_EXCLUDE switches off, with the models of the same provider that are left, or any others when that provider has none.
+// The refusal for a model that OPENCODE_MODEL_EXCLUDE or the blocklist file switches off, with the models of the same provider that are left, or any others when that provider has none.
 function switchedOff(ref) {
   const provider = String(ref).split("/")[0];
   const same = shownModels().filter((x) => x.ref.split("/")[0] === provider);
   const left = (same.length ? same : shownModels()).slice(0, 6).map((x) => x.ref);
-  return `model "${ref}" is switched off on this machine (OPENCODE_MODEL_EXCLUDE)${left.length ? `. Use one of: ${left.join(", ")}` : ""}`;
+  return `model "${ref}" is switched off on this machine (${offReason(ref)})${left.length ? `. Use one of: ${left.join(", ")}` : ""}`;
 }
 // Checks `model`, `effort` and `agent` against the catalog (refreshed once on a miss); returns an error text or "".
 async function validate(args) {
@@ -539,7 +573,7 @@ async function validate(args) {
     args.effort = e;
   }
   // a model named in the call is checked before anything is read from OpenCode
-  if (args.model && EXCLUDE_RE?.test(String(args.model))) return switchedOff(args.model);
+  if (args.model && offReason(args.model)) return switchedOff(args.model);
   if (isClaudeJob(args)) {
     if (!CLAUDE_EXE) return "Claude Code's CLI (claude) was not found; set CLAUDE_EXE";
     const w = args.agent ? workers()[args.agent] : null;
@@ -560,7 +594,7 @@ async function validate(args) {
     const ref = resolveModel(args);
     const m = findModel(ref);
     // the model that will run, whether named, an alias, or an agent's own: the same switch applies
-    if (EXCLUDE_RE && (m?.ref || ref) && EXCLUDE_RE.test(m?.ref || ref)) return switchedOff(m?.ref || ref);
+    if (offReason(m?.ref || ref)) return switchedOff(m?.ref || ref);
     if (args.model && !m) {
       // rank listed models by the name parts they share with the request
       const parts = String(args.model).toLowerCase().split(/[/\-.]/).filter(Boolean);
