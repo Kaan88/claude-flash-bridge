@@ -8,9 +8,10 @@ coding on DeepSeek's API, which doesn't count against your Claude usage limits.
 
 | Tool | What it does |
 |---|---|
-| `opencode_run` | Starts a job and returns **at once** with a job id (`job_k3x_2`). Inputs: `prompt`, `directory`, `allow_edits`, `session`, `model` (any OpenCode model, `provider/id`), `effort` (that model's own levels), `files`, `agent`, `timeout_seconds`, `idle_seconds`. |
-| `opencode_result` | `{ job }` or `{ jobs: [...] }`, plus `wait_seconds?`. Waits up to 55 s for the job, or for **any** of the jobs, then returns each finished reply (ending in `session: ses_…`) and one progress line per job still running (elapsed time, last output, last tool, files edited, why it is queued). With `jobs`, each reply is returned once; repeat the call until it says all are done. |
-| `opencode_cancel` | `{ job }`. Stops a running job and its whole process tree (builds and tests included). Edits stay on disk; the session can be continued. |
+| `opencode_run` | Starts a job and returns **at once** with a job id (`job_k3x_2`). Inputs: `prompt`, `directory`, `allow_edits`, `session`, `model` (any OpenCode model, `provider/id`), `effort` (that model's own levels), `files`, `agent`, `timeout_seconds`, `idle_seconds`, `tool_idle_seconds`. |
+| `opencode_result` | `{ job }` or `{ jobs: [...] }`, plus `wait_seconds?`. Waits up to 55 s for the job, or for **any** of the jobs, then returns each finished reply (ending in `session: ses_…`) and one progress line per job still running (elapsed time, last output, last tool, the tool call in flight, files edited, why it is queued). With `jobs`, each reply is returned once; repeat the call until it says all are done. |
+| `opencode_cancel` | `{ job }`. Stops a queued or running job of **any** session: kills its process tree and interrupts its OpenCode session, so builds and tests it started stop too. The reply's `resume:` line says whether the session is idle or still busy. On a job that already timed out or failed it interrupts a session that is still busy. Edits stay on disk; the session can be continued. |
+| `opencode_list` | No input. Every queued and running job on the machine, from all sessions: id, state, model, owner process (alive or gone), start time, running time, last tool, last output, the tool call in flight, queue place; then who holds the places of each pool, and the sessions an ended job left busy in OpenCode. |
 
 ### Models, effort levels and agents (read live)
 
@@ -36,20 +37,41 @@ Passing `effort` without `model` now applies it to the chosen agent's own model 
 The call returns at once so that a long job can never hit a tool-call timeout (it used to, and lost the reply
 while the edits landed anyway). At most 10 jobs run at once on the machine, across every Claude session (`OPENCODE_MAX_CONCURRENT`), and at most 6 on any one
 local model (`OPENCODE_LOCAL_CONCURRENT`), further jobs queue. Lower it for a server that answers one request at a time.
-The slots are files in `<state folder>/slots`. A server touches its slot files every 5 seconds; a slot is freed automatically when its server exited, stopped touching it for 30 seconds (Windows reuses process ids, so a live id alone proves nothing), or its job already finished. A queued job says which jobs hold the places (`waiting: 2 job(s) already on this local model: job_a_1 (running 340s), ...`), and `opencode_cancel` on one of those ids stops it and, if its server is gone or it has no record, frees its place.
+The slots are files in `<state folder>/slots`. A server touches its slot files every 5 seconds; a slot is freed automatically when its server exited, stopped touching it for 30 seconds (Windows reuses process ids, so a live id alone proves nothing), or its job already finished. Only a queued or running job holds a place: a finished one gives it back at once, whether its reply was fetched or not. A queued job says which jobs hold the places (`waiting: 2 job(s) already on this local model: job_a_1 (running 340s), ...`), `opencode_list` shows the whole queue, and `opencode_cancel` on any of those ids stops it and, if its server is gone or it has no record, frees its place. A cancel from another session is a file (`<job>.cancel`) that the job's own server honours within a second.
 
 **Limits.** A job is stopped after `timeout_seconds` (default `OPENCODE_TIMEOUT_MS`, 60 min, max 4 h) or when
-OpenCode prints nothing for `idle_seconds` (default `OPENCODE_IDLE_MS`, 20 min: one silent build or test run can
-take that long). Either way the whole process tree is killed, so no `dotnet`/build process keeps folders locked.
+it prints nothing for `idle_seconds` (default `OPENCODE_IDLE_MS`, 20 min). While a tool call is in flight (a shell
+running a build or a test suite prints nothing through OpenCode until it ends) the idle limit is
+`tool_idle_seconds` instead (default `OPENCODE_TOOL_IDLE_SECONDS`, 45 min; never shorter than the plain limit,
+never longer than the wall-clock limit). The timeout reason names the tool and how long it ran:
+`no output for 2700s while tool shell "cargo build --release" was in flight for 2710s`.
+
+How a tool in flight is known: Claude Code's event stream shows a tool call starting and ending. OpenCode's
+shows it only when it has ended, so a job that went silent inside a step is asked every 30 s
+(`opencode api session.messages`, the newest three assistant messages) whether a tool call is `running`. If
+OpenCode can't answer, an open step counts as a tool in flight, so a healthy build is not cut short.
+
+**Stopping.** `opencode run` is only a client of OpenCode's background service (`opencode serve --service`):
+the session and the processes its tools start live in the service, so killing the `run` process tree leaves a
+build running and the session busy. On a timeout or a cancel the bridge therefore also asks the service to
+interrupt the session (`opencode api session.interrupt`) and then looks whether it went idle
+(`session.active`). The result says which it is in a `resume:` line: the session can be continued right away,
+or it is still busy (check `opencode_list`, or call `opencode_cancel` on the ended job again), or OpenCode could
+not be asked. A job that continues a session which is still busy says so in its progress line. Claude Code
+jobs run their tools under the `claude` process, so killing its tree is enough there.
 
 **Short replies.** No reply carries OpenCode's raw event log. A timed-out, cancelled or failed job returns a short
-summary: status and reason, elapsed time, the session id (to continue it or ask what it got done), the last tool,
-the files it edited, the tail of its last text (2 KB) and the path of the full log. Every reply is capped at
-`OPENCODE_MAX_REPLY_CHARS` (20 000; head and tail kept, the full text stays in the log).
+summary: status and reason, a `stats:` line, the session id (to continue it or ask what it got done), the
+`resume:` line, the files it edited, the tail of its last text (2 KB) and the path of the full log. Every reply
+is capped at `OPENCODE_MAX_REPLY_CHARS` (20 000; head and tail kept, the full text stays in the log).
+
+Every finished job, successful or not, carries one `stats:` line: the number of tool calls, the total running
+time, the longest silent stretch and the last tool, e.g.
+`stats: 14 tool calls · total 512s · peak idle 203s · last tool shell` (plus `queued 40s first` when it waited).
 
 **Shared jobs.** Each session runs its own copy of the server, so jobs are kept in a state folder
 (`OPENCODE_STATE_DIR`, default `<tmp>/opencode-agent`): `<job>.json` (status, session, progress, the reply) and
-`<job>.jsonl` (the raw event stream). Any copy can report on or cancel any job; ids carry the server's pid, so two
+`<job>.jsonl` (the raw event stream), plus `<job>.cancel` while a cancel from another copy is pending. Any copy can report on, list or cancel any job; ids carry the server's pid, so two
 copies never hand out the same one. If the server that ran a job exits, the job is reported as `lost` (with its
 session and edited files) instead of "unknown"; when a session closes, its server stops its running jobs.
 Finished jobs are kept in memory for 24 hours, and their files stay in the state folder.
@@ -150,7 +172,9 @@ Each session runs its own copy of the server. After changing `server.mjs`: in a 
 | `OPENCODE_READONLY_AGENT` | `<agent>-ro` | agent for read-only jobs |
 | `OPENCODE_MODEL` | `deepseek/deepseek-flash` | model used for the `effort` variants |
 | `OPENCODE_TIMEOUT_MS` | 60 min | default wall-clock limit per job; normally left unset (pass `timeout_seconds` per job instead, max 4 h) |
-| `OPENCODE_IDLE_MS` | 20 min | default limit without any output (`idle_seconds` overrides) |
+| `OPENCODE_IDLE_MS` | 20 min | default limit without any output while no tool call is in flight (`idle_seconds` overrides) |
+| `OPENCODE_TOOL_IDLE_SECONDS` | 2700 (45 min) | default limit without any output while a tool call is in flight (`tool_idle_seconds` overrides) |
+| `OPENCODE_PROBE_MS` | 30000 | how often a silent OpenCode job is asked which tool call is running |
 | `OPENCODE_MAX_CONCURRENT` | 10 | jobs running at once on this machine, all sessions together |
 | `OPENCODE_LOCAL_CONCURRENT` | 6 | jobs running at once on one local model |
 | `CLAUDE_EXE` | found on PATH or in `~/.local/bin` | Claude Code CLI for `claude-code/*` jobs |
@@ -160,6 +184,12 @@ Each session runs its own copy of the server. After changing `server.mjs`: in a 
 | `OPENCODE_KEEP_OLD_MODELS` | off | `1` lists older versions of each model line too |
 | `OPENCODE_MODEL_EXCLUDE` | none | regex on `provider/id` to hide more models, e.g. `-(flex|ultrafast)$` |
 | `OPENCODE_STATE_DIR` | `<tmp>/opencode-agent` | job state and raw logs, shared by every server copy |
+
+## Tests
+
+`node test/test.mjs` (no dependencies, about a minute). It checks the rules on their own (queue places, idle
+limits, the stats line) and then drives the server over MCP stdio against `test/fake-opencode.mjs`, a stand-in
+for the `opencode` executable, so no model is called.
 
 ## The working-mode prompt
 
