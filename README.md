@@ -128,6 +128,8 @@ Needs Node 18+, OpenCode, and Claude Code and/or Claude Desktop.
 2. Clone this repo to `~/.claude/mcp-servers/opencode-agent`.
 3. Run `node install.mjs` in that folder. It:
    - adds the `deepseek-flash` agent (asks before edits and shell commands) to `~/.config/opencode/opencode.json` and removes the old `deepseek-flash-ro`,
+   - removes the server's old name, `deepseek-flash`, wherever Claude Code holds it: user scope, and local scope
+     in every project of `~/.claude.json` (a project's own `.mcp.json` file is left alone: remove it there by hand),
    - registers the server in Claude Code (user scope) without time-limit settings, so every client uses the server's own defaults (it sets `OPENCODE_EXE` only when OpenCode isn't on PATH),
    - adds it to Claude Desktop's `claude_desktop_config.json`,
    - sets `MCP_TOOL_TIMEOUT=1800000` in `~/.claude/settings.json` (a safety net),

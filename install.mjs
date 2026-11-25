@@ -119,6 +119,24 @@ try {
 } catch {
   warn("Claude Code CLI not found or failed; run: claude mcp add --scope user opencode -- node " + server);
 }
+// The old name can also sit in local scope (one entry per project in ~/.claude.json), which
+// `claude mcp remove --scope user` never reaches, so the old tools kept showing in those folders.
+const claudeJson = join(homedir(), ".claude.json");
+if (existsSync(claudeJson)) {
+  let stale = [];
+  try {
+    const c = parseJsonc(readFileSync(claudeJson, "utf8"));
+    if (c.mcpServers?.["deepseek-flash"]) stale.push("(user)");
+    for (const [dir, p] of Object.entries(c.projects || {})) if (p?.mcpServers?.["deepseek-flash"]) stale.push(dir);
+  } catch {}
+  if (stale.length) {
+    editJson(claudeJson, (c) => {
+      delete c.mcpServers?.["deepseek-flash"];
+      for (const p of Object.values(c.projects || {})) delete p?.mcpServers?.["deepseek-flash"];
+    });
+    ok(`removed the old "deepseek-flash" entry from ${stale.length} place(s): ${stale.join(", ")}`);
+  }
+}
 
 // 3. Claude Desktop
 const desktop =
