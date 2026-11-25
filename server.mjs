@@ -301,6 +301,8 @@ const FALLBACK_EFFORTS = ["none", "low", "high", "max"];
 // Zero cost alone is not "free": subscription and local providers report $0 too, and are kept.
 const INCLUDE_FREE = process.env.OPENCODE_INCLUDE_FREE === "1";
 // Optional regex on "provider/id" to hide more models, e.g. "-(fast|flex|ultrafast)$|^openai/gpt-5".
+// It also refuses a job that asks for such a model, by name, by alias or through an agent's own model: hiding a model
+// from the description alone does not stop a caller that names it.
 const EXCLUDE_RE = process.env.OPENCODE_MODEL_EXCLUDE ? new RegExp(process.env.OPENCODE_MODEL_EXCLUDE, "i") : null;
 const CATALOG_FILE = join(STATE_DIR, `catalog-${createHash("sha1").update(process.cwd().toLowerCase()).digest("hex").slice(0, 10)}.json`);
 const LOCAL_HOST = /^(localhost|127\.|10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.|\[?::1\]?$|[^.]+$|.*\.local$)/i;
@@ -522,6 +524,13 @@ function resolveModel(args) {
   return name === DEFAULT_AGENT || name === READONLY_AGENT ? MODEL : catalog?.defaultModel || MODEL;
 }
 
+// The refusal for a model that OPENCODE_MODEL_EXCLUDE switches off, with the models of the same provider that are left, or any others when that provider has none.
+function switchedOff(ref) {
+  const provider = String(ref).split("/")[0];
+  const same = shownModels().filter((x) => x.ref.split("/")[0] === provider);
+  const left = (same.length ? same : shownModels()).slice(0, 6).map((x) => x.ref);
+  return `model "${ref}" is switched off on this machine (OPENCODE_MODEL_EXCLUDE)${left.length ? `. Use one of: ${left.join(", ")}` : ""}`;
+}
 // Checks `model`, `effort` and `agent` against the catalog (refreshed once on a miss); returns an error text or "".
 async function validate(args) {
   if (args.model && String(args.model).includes("#") && !args.effort) {
@@ -529,6 +538,8 @@ async function validate(args) {
     args.model = m;
     args.effort = e;
   }
+  // a model named in the call is checked before anything is read from OpenCode
+  if (args.model && EXCLUDE_RE?.test(String(args.model))) return switchedOff(args.model);
   if (isClaudeJob(args)) {
     if (!CLAUDE_EXE) return "Claude Code's CLI (claude) was not found; set CLAUDE_EXE";
     const w = args.agent ? workers()[args.agent] : null;
@@ -548,6 +559,8 @@ async function validate(args) {
       return `agent "${info.name}" can edit files and run commands without asking, so it can't run a read-only job. Pass allow_edits: true, or leave \`agent\` out and choose the model with \`model\` instead.`;
     const ref = resolveModel(args);
     const m = findModel(ref);
+    // the model that will run, whether named, an alias, or an agent's own: the same switch applies
+    if (EXCLUDE_RE && (m?.ref || ref) && EXCLUDE_RE.test(m?.ref || ref)) return switchedOff(m?.ref || ref);
     if (args.model && !m) {
       // rank listed models by the name parts they share with the request
       const parts = String(args.model).toLowerCase().split(/[/\-.]/).filter(Boolean);

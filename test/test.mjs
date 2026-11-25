@@ -360,6 +360,29 @@ await test("a job whose server died is listed as gone, and cancelling it frees i
 });
 a.stop();
 
+const hidden = new Server("state-hidden", { OPENCODE_MODEL_EXCLUDE: "^lan/" });
+await test("a model switched off by OPENCODE_MODEL_EXCLUDE is hidden and refused, by name, with or without an effort, and others still run", async () => {
+  await hidden.start();
+  const tools = (await hidden.rpc("tools/list", {})).result.tools;
+  assert.doesNotMatch(tools[0].inputSchema.properties.model.description, /lan/, "not offered in the description");
+  for (const model of ["lan/local", "LAN/Local", "lan/local#high"]) {
+    const r = await hidden.call("opencode_run", { prompt: "FAKE:quick", model });
+    assert.equal(r.isError, true, model);
+    assert.match(r.text, /model "lan\/local" is switched off on this machine \(OPENCODE_MODEL_EXCLUDE\)\. Use one of: /i, `${model}: ${r.text}`);
+  }
+  assert.match((await hidden.result(await hidden.run({ prompt: "FAKE:quick" }))).text, /^PONG/, "the default model still runs");
+  assert.match((await hidden.result(await hidden.run({ prompt: "FAKE:quick", model: "fake/model" }))).text, /^PONG/);
+});
+hidden.stop();
+const hiddenAgent = new Server("state-hidden-agent", { OPENCODE_MODEL_EXCLUDE: "^fake/model$" });
+await test("an agent whose own model is switched off is refused too", async () => {
+  await hiddenAgent.start();
+  const r = await hiddenAgent.call("opencode_run", { prompt: "FAKE:quick" });
+  assert.equal(r.isError, true);
+  assert.match(r.text, /model "fake\/model" is switched off/);
+});
+hiddenAgent.stop();
+
 for (const pid of strays) {
   try {
     process.kill(pid);
