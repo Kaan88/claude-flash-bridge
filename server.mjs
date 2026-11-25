@@ -12,7 +12,7 @@
 // into the tool description; Claude is told (tools/list_changed) when a refresh changes them.
 import { execFile, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import { createWriteStream, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, statSync, unlinkSync, watchFile, writeFileSync } from "node:fs";
+import { createWriteStream, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, statSync, unlinkSync, utimesSync, watchFile, writeFileSync } from "node:fs";
 import { createInterface } from "node:readline";
 import { homedir, tmpdir } from "node:os";
 import { delimiter, isAbsolute, join } from "node:path";
@@ -119,12 +119,81 @@ mkdirSync(SLOT_DIR, { recursive: true });
 const held = new Set();
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-function slotOwner(path) {
+function slotInfo(path) {
   try {
-    return JSON.parse(readFileSync(path, "utf8")).pid;
+    return JSON.parse(readFileSync(path, "utf8"));
   } catch {
     return null; // being written, or just released
   }
+}
+function slotOwner(path) {
+  return slotInfo(path)?.pid ?? null;
+}
+// A slot is only held while its server keeps touching the file (every SLOT_BEAT_MS). A process id alone proves
+// nothing: Windows reuses ids, so a slot left by a dead server could look alive for ever. A slot whose job already
+// finished is also stale (a release that never ran).
+const SLOT_BEAT_MS = 5000;
+const SLOT_STALE_MS = 30000;
+function slotStale(path) {
+  const info = slotInfo(path);
+  if (!info) return false; // being written, or just released
+  try {
+    if (Date.now() - statSync(path).mtimeMs > SLOT_STALE_MS) return true;
+  } catch {
+    return false;
+  }
+  if (!alive(info.pid)) return true;
+  if (info.job && !held.has(path)) {
+    const state = readState(info.job);
+    if (state && state.status !== "running" && state.status !== "queued") return true;
+  }
+  return false;
+}
+setInterval(() => {
+  const now = new Date();
+  for (const p of held) {
+    try {
+      utimesSync(p, now, now);
+    } catch {
+      // released meanwhile
+    }
+  }
+}, SLOT_BEAT_MS).unref();
+// the jobs holding the slots of a pool, for the waiting message
+function holders(pool) {
+  try {
+    return readdirSync(SLOT_DIR)
+      .filter((f) => f.startsWith(`${pool}.`))
+      .map((f) => ({ path: join(SLOT_DIR, f), info: slotInfo(join(SLOT_DIR, f)) }))
+      .filter((h) => h.info && !slotStale(h.path))
+      .map((h) => {
+        const st = h.info.job ? readState(h.info.job) : null;
+        const age = st?.started ? ` ${Math.round((Date.now() - st.started) / 1000)}s` : "";
+        return `${h.info.job || "unknown job"} (${st?.status || "no state"}${age})`;
+      });
+  } catch {
+    return [];
+  }
+}
+// Frees the slots a job holds (opencode_cancel on a holder that cannot release them itself).
+function freeSlots(jobId) {
+  let n = 0;
+  try {
+    for (const f of readdirSync(SLOT_DIR)) {
+      const p = join(SLOT_DIR, f);
+      if (slotInfo(p)?.job === jobId && !held.has(p)) {
+        try {
+          unlinkSync(p);
+          n++;
+        } catch {
+          // gone already
+        }
+      }
+    }
+  } catch {
+    // no slot folder
+  }
+  return n;
 }
 function tryTake(pool, size, jobId) {
   for (let i = 0; i < size; i++) {
@@ -136,10 +205,9 @@ function tryTake(pool, size, jobId) {
         return path;
       } catch (e) {
         if (e.code !== "EEXIST") break;
-        const owner = slotOwner(path);
-        if (owner === null || alive(owner)) break;
+        if (!slotStale(path)) break;
         try {
-          unlinkSync(path); // left behind by a server that exited
+          unlinkSync(path); // left behind by a server that exited, stopped beating, or whose job finished
         } catch {
           break;
         }
@@ -160,7 +228,7 @@ function release(path) {
 // slots of a pool currently held by a live server
 function inUse(pool) {
   try {
-    return readdirSync(SLOT_DIR).filter((f) => f.startsWith(`${pool}.`) && alive(slotOwner(join(SLOT_DIR, f)))).length;
+    return readdirSync(SLOT_DIR).filter((f) => f.startsWith(`${pool}.`) && !slotStale(join(SLOT_DIR, f))).length;
   } catch {
     return 0;
   }
@@ -179,7 +247,9 @@ async function limited(job, local, fn) {
         release(own);
         own = null;
       }
-      const why = local && !own ? `waiting: ${LOCAL_CONCURRENT} job(s) already on this local model` : `waiting: ${MAX_CONCURRENT} jobs already running on this machine`;
+      const who = holders(local && !own ? local : "all");
+      const why = (local && !own ? `waiting: ${LOCAL_CONCURRENT} job(s) already on this local model` : `waiting: ${MAX_CONCURRENT} jobs already running on this machine`) +
+        (who.length ? `: ${who.join(", ")}. opencode_cancel on one of these ids frees its place` : "");
       if (job.state.waiting !== why) {
         job.state.waiting = why;
         saveState(job.state);
@@ -1025,7 +1095,11 @@ async function handle(msg) {
     }
     if (params?.name === CANCEL_TOOL.name) {
       const found = current(a.job);
-      if (!found) return reply(`unknown job ${a.job}`, true);
+      if (!found) {
+        // not a job this server can find, but it may still hold a place in the queue
+        const freed = validId(a.job) ? freeSlots(a.job) : 0;
+        return freed ? reply(`${a.job} has no record; its ${freed} held place(s) in the queue are freed`) : reply(`unknown job ${a.job}`, true);
+      }
       const s = found.state;
       if (found.job) {
         if (s.status === "queued") {
@@ -1042,7 +1116,8 @@ async function handle(msg) {
       if (s.status === "running" || s.status === "lost") {
         // owned by another instance (or orphaned): stop the process tree; the owner records the end
         if (alive(s.childPid)) killPidTree(s.childPid);
-        return reply(`${a.job} stopped (process tree ${s.childPid} killed)${s.session ? `; session ${s.session}` : ""}.`);
+        const freed = !alive(s.owner) ? freeSlots(a.job) : 0;
+        return reply(`${a.job} stopped (process tree ${s.childPid} killed)${freed ? `; ${freed} held place(s) in the queue freed` : ""}${s.session ? `; session ${s.session}` : ""}.`);
       }
       if (s.status === "queued") return reply(`${a.job} is queued in another server instance; cancel it from that session`, true);
       return reply(`${a.job} already ${s.status}`);

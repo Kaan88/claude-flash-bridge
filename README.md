@@ -36,7 +36,7 @@ Passing `effort` without `model` now applies it to the chosen agent's own model 
 The call returns at once so that a long job can never hit a tool-call timeout (it used to, and lost the reply
 while the edits landed anyway). At most 10 jobs run at once on the machine, across every Claude session (`OPENCODE_MAX_CONCURRENT`), and at most 2 on any one
 local model (`OPENCODE_LOCAL_CONCURRENT`), since a local server mostly answers one request at a time; further jobs queue.
-The slots are files in `<state folder>/slots`; a slot left by a server that exited is freed automatically.
+The slots are files in `<state folder>/slots`. A server touches its slot files every 5 seconds; a slot is freed automatically when its server exited, stopped touching it for 30 seconds (Windows reuses process ids, so a live id alone proves nothing), or its job already finished. A queued job says which jobs hold the places (`waiting: 2 job(s) already on this local model: job_a_1 (running 340s), ...`), and `opencode_cancel` on one of those ids stops it and, if its server is gone or it has no record, frees its place.
 
 **Limits.** A job is stopped after `timeout_seconds` (default `OPENCODE_TIMEOUT_MS`, 60 min, max 4 h) or when
 OpenCode prints nothing for `idle_seconds` (default `OPENCODE_IDLE_MS`, 20 min: one silent build or test run can
