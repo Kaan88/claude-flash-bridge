@@ -350,7 +350,7 @@ await test("opencode_list shows every session's jobs, and any of them can be can
 
   // its place is free: the job that waited now runs
   assert.match((await b.result(waits)).text, /^PONG/);
-  assert.match((await a.call("opencode_list")).text, /^No job is queued or running\.\n\nPlaces:\nthe machine: 0\/1 places held\n\nSessions still busy without a job: none\.\n\nWorkers: any OpenCode agent or model \(OPENCODE_ALLOW_ANY\)\n\nThis server: client "test", one opencode_result call waits up to 150 s\.$/);
+  assert.match((await a.call("opencode_list")).text, /^No job is queued or running\.\n\nPlaces:\nthe machine: 0\/1 places held\n\nSessions still busy without a job: none\.\n\nWorkers: any OpenCode agent or model \(OPENCODE_ALLOW_ANY\)\n\nThis server: client "test", one opencode_result call waits up to 50 s\.$/);
 });
 
 await test("a job whose server died is listed as gone, and cancelling it frees its place", async () => {
@@ -437,7 +437,7 @@ writeFileSync(
     },
   }),
 );
-const listed = new Server("state-workers", { OPENCODE_ALLOW_ANY: "", BRIDGE_WORKERS_FILE: workersFile, OPENCODE_PROGRESS_MS: "300" });
+const listed = new Server("state-workers", { OPENCODE_ALLOW_ANY: "", BRIDGE_WORKERS_FILE: workersFile, OPENCODE_PROGRESS_MS: "300", OPENCODE_WAIT_SECONDS: "1500" });
 const started = (text) => /started (job_[a-z0-9]+_\d+)/.exec(text)[1];
 await test("with a worker list the tool offers the workers and nothing else", async () => {
   await listed.start("claude-code");
@@ -449,7 +449,7 @@ await test("with a worker list the tool offers the workers and nothing else", as
   assert.match(props.worker.description, /^cc \(Claude Code sonnet, uses the Claude plan\)$/m);
   assert.doesNotMatch(JSON.stringify(tools), /Models \(provider\/id/, "no model catalog");
   for (const t of tools) assert.ok(t.description.length < 2048, `${t.name}: ${t.description.length}`);
-  assert.match(tools[1].description, /up to 1500 s/, "Claude Code gets the long wait");
+  assert.match(tools[1].description, /up to 1500 s/, "OPENCODE_WAIT_SECONDS sets the wait");
 });
 await test("a call runs the default worker, a named one, or is refused: no other agent or model gets through", async () => {
   const first = await listed.call("opencode_run", { prompt: "FAKE:quick" });
@@ -504,11 +504,9 @@ await test("opencode_list names the workers and how long a wait may be", async (
 });
 listed.stop();
 
-await test("the wait limit follows the client, and a worker entry is read strictly", () => {
-  assert.equal(bridge.waitLimit({ env: NaN, client: "claude-code", toolTimeoutMs: NaN }), 1500);
-  assert.equal(bridge.waitLimit({ env: NaN, client: "claude-code", toolTimeoutMs: 300000 }), 240, "a minute under the client's own limit");
-  assert.equal(bridge.waitLimit({ env: NaN, client: "claude-ai", toolTimeoutMs: NaN }), 150, "a client that cuts calls short");
-  assert.equal(bridge.waitLimit({ env: 600, client: "claude-ai", toolTimeoutMs: NaN }), 600, "OPENCODE_WAIT_SECONDS decides");
+await test("the wait is 50 s unless set, and a worker entry is read strictly", () => {
+  assert.equal(bridge.waitLimit({ env: NaN }), 50, "under the 60 s after which the desktop app drops a call and closes the server");
+  assert.equal(bridge.waitLimit({ env: 600 }), 600, "OPENCODE_WAIT_SECONDS decides");
   assert.equal(bridge.readWorker("x", { runs: "opencode" }), null, "an OpenCode worker needs an agent");
   assert.equal(bridge.readWorker("bad name", { runs: "claude", model: "opus" }), null);
   assert.equal(bridge.readWorker("x", { model: "opus" }), null, "no runs: not a worker of the new list");

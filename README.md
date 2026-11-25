@@ -21,7 +21,7 @@ agents, the worker list, and it installs and updates this bridge.
 | Tool | What it does |
 |---|---|
 | `opencode_run` | Starts a job on a worker and returns **at once** with a job id (`job_k3x_2`). Inputs: `prompt`, `worker` (one of the listed names; the default worker when left out), `directory`, `allow_edits`, `session`, `effort` (one of that worker's model's levels), `files`, `timeout_seconds`, `idle_seconds`, `tool_idle_seconds`. |
-| `opencode_result` | `{ job }` or `{ jobs: [...] }`, plus `wait_seconds?`. **One call waits** for the job, or for **any** of the jobs (up to 25 minutes in Claude Code, see "Waiting"), then returns each finished reply (ending in `session: ses_…`) and one progress line per job still running (elapsed time, last output, last tool, the tool call in flight, files edited, why it is queued). With `jobs`, each reply is returned once; call again only while it says jobs are still running. |
+| `opencode_result` | `{ job }` or `{ jobs: [...] }`, plus `wait_seconds?`. **One call waits** for the job, or for **any** of the jobs (50 seconds by default, see "Waiting"), then returns each finished reply (ending in `session: ses_…`) and one progress line per job still running (elapsed time, last output, last tool, the tool call in flight, files edited, why it is queued). With `jobs`, each reply is returned once; call again only while it says jobs are still running. |
 | `opencode_cancel` | `{ job }`. Stops a queued or running job of **any** session: kills its process tree and interrupts its OpenCode session, so builds and tests it started stop too. The reply's `resume:` line says whether the session is idle or still busy. On a job that already timed out or failed it interrupts a session that is still busy. Edits stay on disk; the session can be continued. |
 | `opencode_list` | No input. The workers, how long a wait may be, and every queued and running job on the machine, from all sessions: id, state, model, owner process (alive or gone), start time, running time, last tool, last output, the tool call in flight, queue place; then who holds the places of each pool, and the sessions an ended job left busy in OpenCode. |
 
@@ -65,68 +65,20 @@ every worker that would run on it.
 
 ### Waiting
 
-A wait is one tool call, and a tool call that is waiting costs nothing. A poll every 55 seconds, which is what this
-bridge asked for before, costs one model request each time, with the whole conversation read again. So
-`opencode_result` now waits until a job ends:
+A wait is one tool call, and a tool call that is waiting costs nothing; each repeated call costs one model request,
+with the whole conversation read again. `opencode_result` therefore waits as long as it safely can:
 
-- in Claude Code up to 25 minutes per call (a minute under `MCP_TOOL_TIMEOUT` when that is shorter). Claude Code moves
-  a call that runs longer than two minutes to the background and tells the session when it settles, so Claude can go
-  on with other work, or end its turn, meanwhile;
-- in other clients 150 seconds, because they cut a tool call short (Claude Desktop's chat: 180 s by default);
-- `OPENCODE_WAIT_SECONDS` sets it for every client; `wait_seconds: 0` in a call only looks.
+- **50 seconds by default.** The Claude desktop app gives up on a tool call after about 60 seconds and then closes
+  the server, which cancels every job that server runs. Version 3.0.0 waited up to 25 minutes in Claude Code and lost
+  jobs that way in the desktop app; 3.0.1 took that back.
+- **`OPENCODE_WAIT_SECONDS`** sets a longer wait where the client allows it. In the Claude Code CLI a 154-second
+  wait was tried and worked. Set it in the server's registration (`claude mcp add -e OPENCODE_WAIT_SECONDS=1500 …`)
+  only for a client you have tried it in.
+- `wait_seconds: 0` in a call only looks.
 
 While it waits it sends a progress message every 20 seconds to a client that asked for progress. A call the client
 gave up on (the user interrupted it, or its own limit ran out) is not answered, so a reply is never counted as
 delivered without having been read; the next call returns it.
-
-The call returns at once so that a long job can never hit a tool-call timeout (it used to, and lost the reply
-while the edits landed anyway). At most 10 jobs run at once on the machine, across every Claude session (`OPENCODE_MAX_CONCURRENT`), and at most 6 on any one
-local model (`OPENCODE_LOCAL_CONCURRENT`), further jobs queue. Lower it for a server that answers one request at a time.
-The slots are files in `<state folder>/slots`. A server touches its slot files every 5 seconds; a slot is freed automatically when its server exited, stopped touching it for 30 seconds (Windows reuses process ids, so a live id alone proves nothing), or its job already finished. Only a queued or running job holds a place: a finished one gives it back at once, whether its reply was fetched or not. A queued job says which jobs hold the places (`waiting: 2 job(s) already on this local model: job_a_1 (running 340s), ...`), `opencode_list` shows the whole queue, and `opencode_cancel` on any of those ids stops it and, if its server is gone or it has no record, frees its place. A cancel from another session is a file (`<job>.cancel`) that the job's own server honours within a second.
-
-**Limits.** A job is stopped after `timeout_seconds` (default `OPENCODE_TIMEOUT_MS`, 60 min, max 4 h) or when
-it prints nothing for `idle_seconds` (default `OPENCODE_IDLE_MS`, 20 min). While a tool call is in flight (a shell
-running a build or a test suite prints nothing through OpenCode until it ends) the idle limit is
-`tool_idle_seconds` instead (default `OPENCODE_TOOL_IDLE_SECONDS`, 45 min; never shorter than the plain limit,
-never longer than the wall-clock limit). The timeout reason names the tool and how long it ran:
-`no output for 2700s while tool shell "cargo build --release" was in flight for 2710s`.
-
-How a tool in flight is known: Claude Code's event stream shows a tool call starting and ending. OpenCode's
-shows it only when it has ended, so a job that went silent inside a step is asked every 30 s
-(`opencode api session.messages`, the newest three assistant messages) whether a tool call is `running`. If
-OpenCode can't answer, an open step counts as a tool in flight, so a healthy build is not cut short.
-
-**Stopping.** `opencode run` is only a client of OpenCode's background service (`opencode serve --service`):
-the session and the processes its tools start live in the service, so killing the `run` process tree leaves a
-build running and the session busy. On a timeout or a cancel the bridge therefore also asks the service to
-interrupt the session (`opencode api session.interrupt`) and then looks whether it went idle
-(`session.active`). The result says which it is in a `resume:` line: the session can be continued right away,
-or it is still busy (check `opencode_list`, or call `opencode_cancel` on the ended job again), or OpenCode could
-not be asked. A job that continues a session which is still busy says so in its progress line. Claude Code
-jobs run their tools under the `claude` process, so killing its tree is enough there.
-
-**Short replies.** No reply carries OpenCode's raw event log. A timed-out, cancelled or failed job returns a short
-summary: status and reason, a `stats:` line, the session id (to continue it or ask what it got done), the
-`resume:` line, the files it edited, the tail of its last text (2 KB) and the path of the full log. Every reply
-is capped at `OPENCODE_MAX_REPLY_CHARS` (20 000; head and tail kept, the full text stays in the log).
-
-Every finished job, successful or not, carries one `stats:` line: the number of tool calls, the total running
-time, the longest silent stretch and the last tool, e.g.
-`stats: 14 tool calls · total 512s · peak idle 203s · last tool shell` (plus `queued 40s first` when it waited).
-
-**Shared jobs.** Each session runs its own copy of the server, so jobs are kept in a state folder
-(`OPENCODE_STATE_DIR`, default `<tmp>/opencode-agent`): `<job>.json` (status, session, progress, the reply) and
-`<job>.jsonl` (the raw event stream), plus `<job>.cancel` while a cancel from another copy is pending. Any copy can report on, list or cancel any job; ids carry the server's pid, so two
-copies never hand out the same one. If the server that ran a job exits, the job is reported as `lost` (with its
-session and edited files) instead of "unknown"; when a session closes, its server stops its running jobs.
-Finished jobs are kept in memory for 24 hours; their files are deleted after 3 days (`OPENCODE_KEEP_DAYS`, 0 keeps them).
-
-The `deepseek-flash` agent's edits and shell commands are set to **ask**. Without `allow_edits` a job runs without
-`--auto`, and OpenCode rejects every ask when nobody can answer it, so the agent can read files and run the allowed
-read-only commands (git status/diff/log/show, cargo check/clippy/test) but can't change anything. With `allow_edits` the job
-runs with `--auto`, which approves them. The same holds for any agent whose edits are "ask" or "deny"; an agent that edits
-or runs shell commands freely is refused for read-only jobs. An older install's `deepseek-flash-ro` twin is
-still used while it exists; the installer removes it.
 
 ## Claude Code workers
 
@@ -216,7 +168,7 @@ Each session runs its own copy of the server. After changing `server.mjs`: in a 
 | `OPENCODE_KEEP_DAYS` | 3 | job files older than this are deleted when a server starts; 0 keeps them all |
 | `BRIDGE_WORKERS_FILE` | `~/.config/opencode-bridge/workers.json` | the worker list |
 | `CLAUDE_WORKERS_FILE` | `~/.claude/claude-workers.json` | the older Claude workers file, read only while the worker list does not exist |
-| `OPENCODE_WAIT_SECONDS` | 1500 in Claude Code, 150 elsewhere | how long one `opencode_result` call may wait |
+| `OPENCODE_WAIT_SECONDS` | 50 | how long one `opencode_result` call may wait; raise it only for a client that keeps a long call open |
 | `OPENCODE_ALLOW_ANY` | off | `1`: no worker list; any OpenCode agent or model can be asked for with `agent` and `model`, as before 3.0 |
 
 ## Tests

@@ -174,18 +174,16 @@ function pruneFiles(now = Date.now()) {
 }
 
 // ---- how long one opencode_result call may wait ----
-// A wait is one tool call, and a tool call that is waiting costs the caller nothing. A poll every 55 s costs one model
-// request each time, with the whole conversation read again. Claude Code lets a tool call run long (its limit is
-// MCP_TOOL_TIMEOUT, far longer when unset, and 30 minutes without any progress message) and moves a call that
-// runs over two minutes to the background, telling the session when it settles. Other clients cut a call short
-// (Claude Desktop's chat: 180 s by default), so they get short waits. OPENCODE_WAIT_SECONDS sets it for every client.
+// A wait is one tool call, and a tool call that is waiting costs the caller nothing, where every repeated call costs
+// one model request with the whole conversation read again. So the longer one call may wait, the better, up to what
+// the client allows.
 const WAIT_ENV = Number(process.env.OPENCODE_WAIT_SECONDS);
 let clientName = "";
-export function waitLimit({ env = WAIT_ENV, client = clientName, toolTimeoutMs = Number(process.env.MCP_TOOL_TIMEOUT) } = {}) {
-  if (Number.isFinite(env) && env > 0) return env;
-  if (!/claude-code/i.test(client)) return 150;
-  const byClient = Number.isFinite(toolTimeoutMs) && toolTimeoutMs > 0 ? toolTimeoutMs / 1000 - 60 : Infinity;
-  return Math.max(55, Math.min(1500, byClient));
+// 50 s unless OPENCODE_WAIT_SECONDS says otherwise. A longer default was tried (3.0.0) and withdrawn: the Claude
+// desktop app gives up on a tool call after about 60 s and then closes the server, which cancels every job it runs.
+// The CLI does wait longer (a 154 s wait worked there), so a long wait is something to switch on, not the default.
+export function waitLimit({ env = WAIT_ENV } = {}) {
+  return Number.isFinite(env) && env > 0 ? env : 50;
 }
 const PROGRESS_MS = Math.max(250, Number(process.env.OPENCODE_PROGRESS_MS || 20000));
 
@@ -1694,10 +1692,9 @@ async function cancelJob(id) {
 // that treats them that way waits for nothing or polls now and then with sleep, Monitor or wakeups.
 const SERVER_INSTRUCTIONS =
   "`opencode_run` hands a task to one of the user's workers (listed in its `worker` parameter; nothing else can be run) and returns a job id at once. " +
-  "Wait with ONE `opencode_result` call that holds every job id: it returns when a job ends, and can wait many minutes. " +
-  "Claude Code may move such a wait to the background after two minutes and tell you when it settles; then carry on with other work, " +
-  "or end the turn, and do not call it again for the same jobs meanwhile. Never poll: no sleep, Monitor, ScheduleWakeup, cron, " +
-  "background shell loop, subagent or short repeated waits, and no status message between waits. Call it again only when it came back with jobs still running.";
+  "Wait with `opencode_result`, one call that holds every job id: it waits as long as this client allows and returns when a job ends. " +
+  "While it comes back with jobs still running, call it again right away, with no status message in between. Never wait any other way: " +
+  "no sleep, Monitor, ScheduleWakeup, cron, background shell loop or subagent, and do not end the turn while a job you need is running.";
 
 const send = (msg) => process.stdout.write(JSON.stringify(msg) + "\n");
 
@@ -1711,7 +1708,7 @@ async function handle(msg) {
       result: {
         protocolVersion: params?.protocolVersion || "2025-06-18",
         capabilities: { tools: { listChanged: true } },
-        serverInfo: { name: "opencode-agent", version: "3.0.0" },
+        serverInfo: { name: "opencode-agent", version: "3.0.1" },
         instructions: SERVER_INSTRUCTIONS,
       },
     });

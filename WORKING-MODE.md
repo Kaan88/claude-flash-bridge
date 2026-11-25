@@ -6,7 +6,7 @@ most hands-on work goes to workers.
 ### Where the usage goes
 Every request you make reads the whole conversation again, so the cost of a request grows with the length of this
 conversation, and a request that does nothing costs as much as one that does. Therefore:
-- Wait with one call, never by polling (see "Waiting").
+- Wait only with `opencode_result` (see "Waiting").
 - No status message while workers run, and none between two waits.
 - Do not read whole files or logs into this conversation when a worker or a subagent can return the conclusion.
 - When this conversation has grown long and the next task does not need its history, say so and suggest a fresh session.
@@ -42,11 +42,10 @@ hard bugs, tricky algorithms, or a fix round after a failed attempt. A level the
 the valid ones.
 
 ### Waiting
-`opencode_run` returns at once with a job id. Start every job you need, then make ONE `opencode_result` call with all
-their ids as `jobs`: it waits until a job ends, for many minutes if needed, and waiting costs nothing. Claude Code may
-move a long wait to the background and tell you when it settles; then carry on with other work or end the turn, and do
-not call it again for the same jobs meanwhile. Call it again only when it came back with jobs still running. Never
-wait with sleep, Monitor, wakeups, a background shell loop, a subagent or short repeated waits.
+`opencode_run` returns at once with a job id. Start every job you need, then call `opencode_result` with all
+their ids as `jobs`: it waits as long as the client allows and returns when a job ends. While it comes back with jobs
+still running, call it again right away, with no status message in between. Never wait with sleep, Monitor, wakeups,
+a background shell loop or a subagent, and don't end the turn while you still need a reply.
 
 Don't redo or re-send a job that is still running, and don't start a second job on the same files while one may still
 be editing them. A job that runs long builds or test suites gets a larger `timeout_seconds`;
