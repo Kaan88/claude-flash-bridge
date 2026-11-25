@@ -73,7 +73,15 @@ if [ -f "$DIR/server.mjs" ]; then
     say "Bridge found in $DIR; updating it"
     git -C "$DIR" pull -q --ff-only 2>/dev/null || warn "Could not update it (local changes, or no network); using it as it is."
   else
-    say "Bridge found in $DIR; using it as it is"
+    # a copied folder (not a clone) was never updated: make it a clone of the latest version, keeping a backup
+    say "Bridge found in $DIR (not a git clone); updating it to the latest version"
+    backup="$DIR.old-$(date +%Y%m%d-%H%M%S)"; cp -R "$DIR" "$backup"
+    tmp="$(mktemp -d)"
+    if have git; then git clone -q "$REPO" "$tmp/b"
+    else mkdir -p "$tmp/b" && curl -fsSL "$REPO/archive/refs/heads/main.tar.gz" | tar -xz -C "$tmp/b" --strip-components=1; fi
+    [ -f "$tmp/b/server.mjs" ] || { echo "Could not download the bridge; the old copy is unchanged." >&2; exit 1; }
+    cp -R "$tmp/b/." "$DIR/"; rm -rf "$tmp"
+    say "Updated; the previous copy is in $backup"
   fi
 elif have git && [ -z "$(ls -A "$DIR" 2>/dev/null)" ]; then
   say "Installing the bridge into $DIR"

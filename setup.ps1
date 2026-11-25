@@ -86,7 +86,26 @@ if (Test-Path (Join-Path $Dir "server.mjs")) {
         git -C $Dir pull -q --ff-only 2>$null
         if ($LASTEXITCODE -ne 0) { Warn "Could not update it (local changes, or no network); using it as it is." }
     } else {
-        Say "Bridge found in $Dir; using it as it is"
+        # a copied folder (not a clone) was never updated, so an old install.mjs kept registering the old name:
+        # turn it into a clone of the latest version, keeping a backup of what was there
+        Say "Bridge found in $Dir (not a git clone); updating it to the latest version"
+        $backup = "$Dir.old-$(Get-Date -Format yyyyMMdd-HHmmss)"
+        Copy-Item $Dir $backup -Recurse -Force
+        $tmp = Join-Path ([IO.Path]::GetTempPath()) "flash-bridge-$PID"
+        Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue
+        if (Have git) {
+            git clone -q $Repo $tmp
+        } else {
+            $zip = "$tmp.zip"
+            Invoke-WebRequest "$Repo/archive/refs/heads/main.zip" -OutFile $zip -UseBasicParsing
+            Expand-Archive $zip "$tmp-x" -Force; Remove-Item $zip
+            Move-Item (Get-ChildItem "$tmp-x" -Directory | Select-Object -First 1).FullName $tmp; Remove-Item "$tmp-x" -Recurse -Force
+        }
+        if (-not (Test-Path (Join-Path $tmp "server.mjs"))) { throw "Could not download the bridge; the old copy is unchanged." }
+        Copy-Item (Join-Path $tmp "*") $Dir -Recurse -Force
+        Copy-Item (Join-Path $tmp ".git") $Dir -Recurse -Force -ErrorAction SilentlyContinue
+        Remove-Item $tmp -Recurse -Force
+        Say "Updated; the previous copy is in $backup"
     }
 } elseif ((Have git) -and -not (Test-Path (Join-Path $Dir "*"))) {
     Say "Installing the bridge into $Dir"
