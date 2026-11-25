@@ -4,7 +4,7 @@
 //
 // Jobs are shared between server instances through a state folder (OPENCODE_STATE_DIR, default
 // <tmp>/opencode-agent): every job writes <id>.json (status, session, progress, the capped reply) and
-// <id>.jsonl (OpenCode's raw event stream). Any instance can answer or cancel any job, and a reply
+// <id>.jsonl (OpenCode's raw event stream). Any instance can answer, list or cancel any job, and a reply
 // never carries the raw log: a timed-out or failed job returns a short summary plus the log's path.
 //
 // The models, their real effort levels (OpenCode "variants") and the agents are read from OpenCode when the
@@ -305,9 +305,10 @@ const EXCLUDE_RE = process.env.OPENCODE_MODEL_EXCLUDE ? new RegExp(process.env.O
 const CATALOG_FILE = join(STATE_DIR, `catalog-${createHash("sha1").update(process.cwd().toLowerCase()).digest("hex").slice(0, 10)}.json`);
 const LOCAL_HOST = /^(localhost|127\.|10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.|\[?::1\]?$|[^.]+$|.*\.local$)/i;
 
-function ocApi(op) {
+function ocApi(op, params = [], timeout = 20000) {
   return new Promise((resolve, reject) => {
-    execFile(OPENCODE_EXE, ["api", op], { windowsHide: true, timeout: 20000, maxBuffer: 64 * 1024 * 1024 }, (err, out) => {
+    const args = ["api", op, ...params.flatMap((p) => ["--param", p])];
+    execFile(OPENCODE_EXE, args, { windowsHide: true, timeout, maxBuffer: 64 * 1024 * 1024 }, (err, out) => {
       if (err) return reject(err);
       try {
         const j = JSON.parse(out);
@@ -580,7 +581,7 @@ const buildTool = () => ({
     "your Claude plan, Claude Code's tools and CLAUDE.md, no MCP servers). " +
     "A new session starts with NO context: put everything it needs in `prompt` (paths, goal, constraints, output format). Pass `session` to continue an earlier one instead. " +
     "Without `allow_edits` the job is read-only (enforced, not just asked): it can read, search and run read-only commands. " +
-    `At most ${MAX_CONCURRENT} jobs run at once on this machine and ${LOCAL_CONCURRENT} per local model; more queue. A job stops after \`timeout_seconds\` (default ${TIMEOUT_MS / 1000}) or \`idle_seconds\` without output (default ${IDLE_MS / 1000}).`,
+    `At most ${MAX_CONCURRENT} jobs run at once on this machine and ${LOCAL_CONCURRENT} per local model; more queue (\`opencode_list\` shows them). A job stops after \`timeout_seconds\` (default ${TIMEOUT_MS / 1000}), or \`idle_seconds\` without output (default ${IDLE_MS / 1000}; ${TOOL_IDLE_MS / 1000} while a tool call such as a build is in flight).`,
   inputSchema: {
     type: "object",
     properties: {
@@ -621,7 +622,11 @@ const buildTool = () => ({
       },
       idle_seconds: {
         type: "number",
-        description: `Stop the job when OpenCode prints nothing for this long. Default ${IDLE_MS / 1000}, at most the wall-clock limit.`,
+        description: `Stop the job when it prints nothing for this long and no tool call is in flight. Default ${IDLE_MS / 1000}, at most the wall-clock limit.`,
+      },
+      tool_idle_seconds: {
+        type: "number",
+        description: `The idle limit while a tool call (a build, a test run) is in flight. Default ${TOOL_IDLE_MS / 1000}, at least idle_seconds, at most the wall-clock limit.`,
       },
       agent: {
         type: "string",
@@ -661,7 +666,8 @@ const RESULT_TOOL = {
 const CANCEL_TOOL = {
   name: "opencode_cancel",
   description:
-    "Stop a queued or running job from any session (any id `opencode_list` shows) and its whole process tree (builds and tests it started included). Edits it already made stay on disk; its session can be continued later.",
+    "Stop a queued or running job from any session (any id `opencode_list` shows): kills its process tree and interrupts its OpenCode session, builds and tests it started included. " +
+    "The reply's `resume:` line says whether the session is idle or still busy. On a job that already timed out or failed it interrupts a session that is still busy. Edits already made stay on disk.",
   inputSchema: {
     type: "object",
     properties: { job: { type: "string", description: "The job id to stop." } },
@@ -673,7 +679,7 @@ const LIST_TOOL = {
   name: "opencode_list",
   description:
     "Lists every queued and running job on this machine, from all sessions: id, owner process (alive or gone), model, state, start time, running time, last tool, " +
-    "queue place, and which jobs hold the places of each pool. Any listed id can be passed to `opencode_cancel`.",
+    "tool call in flight, queue place, which jobs hold the places of each pool, and sessions an ended job left busy in OpenCode. Any listed id can be passed to `opencode_cancel`.",
   inputSchema: { type: "object", properties: {} },
 };
 
@@ -745,6 +751,7 @@ function startJob(args) {
   const id = `${PREFIX}_${nextJob++}`;
   const wall = clampMs(args.timeout_seconds, TIMEOUT_MS, MAX_TIMEOUT_MS);
   const idle = Math.min(clampMs(args.idle_seconds, IDLE_MS, MAX_TIMEOUT_MS), wall);
+  const toolIdle = Math.min(Math.max(idle, clampMs(args.tool_idle_seconds, TOOL_IDLE_MS, MAX_TIMEOUT_MS)), wall);
   const state = {
     id,
     owner: process.pid,
@@ -754,6 +761,7 @@ function startJob(args) {
     session: args.session || "",
     timeoutMs: wall,
     idleMs: idle,
+    toolIdleMs: toolIdle,
     lastTool: "",
     files: [],
     reply: "",
@@ -804,6 +812,102 @@ function cap(text, max, where) {
   return `${text.slice(0, half)}\n\n[… ${text.length - 2 * half} characters cut; full output in ${where} …]\n\n${text.slice(-half)}`;
 }
 
+// ---- idle limits, tool calls in flight, and the one-line statistics (no file or process access: tested directly) ----
+
+// `shell "cargo build --release"`: the tool and the first 80 characters of what it runs or reads.
+export function toolLabel(name, input) {
+  const i = input && typeof input === "object" ? input : {};
+  const what = [i.command, i.cmd, i.description, i.filePath, i.file_path, i.path, i.pattern].find((v) => typeof v === "string" && v.trim());
+  return what ? `${name} "${what.replace(/\s+/g, " ").trim().slice(0, 80)}"` : String(name);
+}
+
+// Which idle limit applies and whether it has run out. A tool call that started and has not ended (`flight`) is
+// activity in itself: a build prints nothing through OpenCode for many minutes, so the longer limit applies then.
+export function idleVerdict({ quietMs, idleMs, toolIdleMs, flight }) {
+  const limitMs = flight ? Math.max(idleMs, toolIdleMs) : idleMs;
+  return { limitMs, expired: quietMs > limitMs };
+}
+
+export function idleReason({ limitMs, flight, now = Date.now() }) {
+  const base = `no output for ${Math.round(limitMs / 1000)}s`;
+  if (!flight) return `${base}, no tool call in flight`;
+  if (flight.unknown) return `${base} inside an open step (OpenCode could not say which tool was running)`;
+  return `${base} while tool ${flight.label} was in flight for ${Math.round((now - flight.since) / 1000)}s`;
+}
+
+// Searches the newest messages of an OpenCode session (`session.messages`) for a tool call that is running:
+// { type: "tool", name, state: { status: "running", input }, time: { created, ran } }.
+export function findRunningTool(data, now = Date.now()) {
+  const when = (v) => (typeof v === "number" && v > 1e11 ? v : typeof v === "string" && !Number.isNaN(Date.parse(v)) ? Date.parse(v) : 0);
+  let found = null;
+  const walk = (v, depth) => {
+    if (found || !v || typeof v !== "object" || depth > 8) return;
+    if (!Array.isArray(v) && v.type === "tool" && typeof v.name === "string" && v.state?.status === "running") {
+      found = { label: toolLabel(v.name, v.state.input), since: when(v.time?.ran) || when(v.time?.created) || now };
+      return;
+    }
+    for (const x of Array.isArray(v) ? v : Object.values(v)) walk(x, depth + 1);
+  };
+  walk(data, 0);
+  return found;
+}
+
+const secs = (ms) => `${Math.max(0, Math.round(ms / 1000))}s`;
+export function statsLine({ tools, totalMs, peakIdleMs, lastTool }) {
+  return `${tools} tool call${tools === 1 ? "" : "s"} · total ${secs(totalMs)} · peak idle ${secs(peakIdleMs)} · last tool ${lastTool || "(none)"}`;
+}
+
+// What to tell the caller about continuing the session of a job that was stopped.
+export function resumeNote({ claude, session, interrupted, busy }) {
+  if (!session) return "resume: no session was created; start a new job";
+  if (claude) return "resume: its process tree was killed; the session can be continued right away";
+  if (busy === false) return `resume: OpenCode reports the session idle${interrupted ? " (its run was interrupted)" : ""}; it can be continued right away`;
+  if (busy === true)
+    return (
+      "resume: the session is STILL BUSY in OpenCode after an interrupt request: a tool it started (a build) may still be running, and a continued job would wait behind it in silence. " +
+      'Before continuing, check opencode_list ("Sessions still busy") or call opencode_cancel on this job again'
+    );
+  return (
+    `resume: OpenCode could not be asked whether the session is still busy${interrupted ? " (it accepted the interrupt)" : ""}. ` +
+    "If a continued job stays silent, the old run is still going: wait a minute, look at opencode_list, or call opencode_cancel on this job again"
+  );
+}
+
+// ---- stopping a session inside OpenCode's background service ----
+// `opencode run` only talks to the service (`opencode serve --service`); the session's loop and the processes its
+// tools start live there, not under the `run` process this server spawned and can kill.
+
+const ocSession = (s) => (s.session && !CLAUDE_SESSION.test(s.session) && !String(s.model || "").startsWith(`${CLAUDE_PROVIDER}/`) ? s.session : "");
+
+// The ids of the sessions the service is executing now (`session.active`), or null when it can't be asked.
+async function activeSessions() {
+  try {
+    const act = await ocApi("session.active", [], 8000);
+    if (Array.isArray(act)) return act.map((x) => (typeof x === "string" ? x : x?.sessionID || x?.id)).filter(Boolean);
+    return act && typeof act === "object" ? Object.keys(act) : null;
+  } catch {
+    return null;
+  }
+}
+const sessionBusy = async (session) => (await activeSessions())?.includes(session) ?? null;
+
+// Asks the service to interrupt the session's run (`session.interrupt`), then looks whether it went idle.
+async function stopSession(session) {
+  let interrupted = null;
+  try {
+    interrupted = !!(await ocApi("session.interrupt", [`sessionID=${session}`], 8000))?.interrupted;
+  } catch {
+    // an OpenCode without this call, or no service running
+  }
+  let busy = null;
+  for (let i = 0; i < 4; i++) {
+    await sleep(i ? 1500 : 400);
+    busy = await sessionBusy(session);
+    if (busy !== true) break;
+  }
+  return { interrupted, busy };
+}
+
 // Reads one OpenCode JSON event into the job's running summary.
 function absorb(job, acc, ev) {
   const s = job.state;
@@ -818,26 +922,46 @@ function absorb(job, acc, ev) {
   if (ev.type === "retry") s.retry = `attempt ${ev.attempt}: ${String(ev.error?.message || "").slice(0, 160)}`;
   else if (ev.type === "step_finish" || ev.type === "text") s.retry = "";
   if (ev.type === "error") acc.errors.push(cap(JSON.stringify(ev.error ?? part ?? ev), 1000, s.log));
+  // a step is the model's turn plus the tool calls it made: between its start and its finish a tool may be running
+  if (ev.type === "step_start") acc.stepOpen = true;
+  if (ev.type === "step_finish") acc.stepOpen = false;
   const tool = part.tool || (ev.type === "tool_use" ? ev.tool : "");
   if (tool) {
     s.lastTool = tool;
     const input = part.state?.input || part.input || {};
+    // OpenCode 2.x reports a tool call once, when it has ended; a version that also reports the start is followed too
+    const key = part.id || part.callID || `${tool}#${acc.tools}`;
+    if (/^(running|pending)$/.test(part.state?.status || "")) acc.flights.set(key, { label: toolLabel(tool, input), since: Date.now() });
+    else {
+      acc.flights.delete(key);
+      acc.tools++;
+    }
     const file = input.filePath || input.file_path || input.path;
     if (typeof file === "string" && /^(edit|write|patch|multiedit|apply_patch)$/i.test(tool) && !s.files.includes(file)) s.files.push(file);
   }
 }
 
-function summary(job, acc, status, reason) {
+// Counts the job's tool calls, total time and longest silent stretch into its state; returns them as one line.
+function stats(job, acc) {
   const s = job.state;
-  const elapsed = Math.round((Date.now() - s.started) / 1000);
+  const now = Date.now();
+  s.tools = acc.tools;
+  s.peakIdleMs = Math.max(acc.peakIdle, now - (s.lastEvent || now));
+  const waited = (s.running || now) - s.started;
+  return statsLine({ tools: s.tools, totalMs: now - (s.running || s.started), peakIdleMs: s.peakIdleMs, lastTool: s.lastTool }) + (waited >= 1000 ? ` · queued ${secs(waited)} first` : "");
+}
+
+function summary(job, acc, status, reason, note = "") {
+  const s = job.state;
   const last = clean(acc.texts.join("\n\n"));
   const lines = [
     `status: ${status} (${reason})`,
-    `elapsed: ${elapsed}s`,
+    `stats: ${stats(job, acc)}`,
     `session: ${s.session || "(none)"}${s.session ? " (pass as `session` to continue or ask what it got done)" : ""}`,
-    `last tool: ${s.lastTool || "(none)"}`,
     `files edited: ${s.files.length ? s.files.join(", ") : "(none reported)"}`,
   ];
+  if (note) lines.splice(3, 0, note);
+  if (s.note) lines.push(`note: ${s.note}`);
   if (acc.errors.length) lines.push(`errors: ${acc.errors.slice(-3).join("\n")}`);
   if (s.retry) lines.push(`provider retrying (${s.retry})`);
   if (acc.stderr.trim()) lines.push(`stderr (tail): ${stripAnsi(acc.stderr).trim().slice(-800)}`);
@@ -868,10 +992,15 @@ function absorbClaude(job, acc, ev) {
       if (c.type === "text" && c.text) acc.texts.push(c.text);
       if (c.type === "tool_use") {
         s.lastTool = c.name;
+        acc.tools++;
+        if (c.id) acc.flights.set(c.id, { label: toolLabel(c.name, c.input), since: Date.now() });
         const file = c.input?.file_path || c.input?.notebook_path;
         if (typeof file === "string" && /^(Edit|Write|MultiEdit|NotebookEdit)$/.test(c.name) && !s.files.includes(file)) s.files.push(file);
       }
     }
+  // a tool call ends with its result, which comes back as a user message
+  if (ev.type === "user" && Array.isArray(ev.message?.content)) for (const c of ev.message.content) if (c.type === "tool_result") acc.flights.delete(c.tool_use_id);
+  if (ev.type === "result") acc.flights.clear();
   if (ev.type === "system" && ev.subtype === "api_retry") s.retry = `attempt ${ev.attempt}: ${String(ev.error || "").slice(0, 160)}`;
   else if (ev.type === "assistant") s.retry = "";
   if (ev.type === "result") {
@@ -920,7 +1049,7 @@ function runAgent(job, { prompt, directory, files = [], allow_edits = false, age
     }
     const take = claude ? absorbClaude : absorb;
 
-    const acc = { texts: [], errors: [], cost: 0, reasoning: 0, stderr: "" };
+    const acc = { texts: [], errors: [], cost: 0, reasoning: 0, stderr: "", tools: 0, peakIdle: 0, stepOpen: false, flights: new Map() };
     const log = createWriteStream(s.log);
     let child;
     try {
@@ -944,34 +1073,94 @@ function runAgent(job, { prompt, directory, files = [], allow_edits = false, age
     s.lastEvent = Date.now();
     saveState(s);
 
+    // continuing a session whose earlier run never stopped would wait behind it without a word: say so
+    if (!claude && session)
+      sessionBusy(session).then((busy) => {
+        if (busy && !ended) {
+          s.note = "its session was still busy with an earlier run when this job started; opencode_cancel on the earlier job interrupts that run";
+          saveState(s);
+        }
+      });
+
     let ended = false;
-    const end = (status, reason) => {
+    // `fast` (the server is closing): no time to wait for OpenCode's answer
+    const end = (status, reason, fast = false) => {
       if (ended) return;
       ended = true;
       clearTimeout(wallTimer);
       clearInterval(idleTimer);
-      if (status !== "done") killPidTree(child.pid);
+      if (child.exitCode === null && child.signalCode === null) killPidTree(child.pid);
       log.end();
-      resolve(finish(job, status, summary(job, acc, status, reason)));
+      s.inFlight = null;
+      const done =(note) => resolve(finish(job, status, summary(job, acc, status, reason, note)));
+      // `opencode run` is a client of OpenCode's background service: the session and its tools (a build) run
+      // there, so killing the client is not enough. Ask the service to interrupt the session, and report the outcome.
+      if (claude || !s.session) return done(resumeNote({ claude, session: s.session }));
+      const stopping = stopSession(s.session);
+      if (fast) return done(resumeNote({ session: s.session, interrupted: null, busy: null }));
+      stopping.then((r) => done(resumeNote({ session: s.session, ...r })));
     };
-    job.cancel = () => end("cancelled", "stopped by opencode_cancel");
+    job.cancel = (fast = false) => end("cancelled", fast ? "its Claude session closed" : "stopped by opencode_cancel", fast);
 
-    const wallTimer = setTimeout(() => end("timeout", `wall-clock limit ${s.timeoutMs / 1000}s`), s.timeoutMs);
-    // once a second: write changed progress for other instances, and check the idle limit
+    const wallTimer = setTimeout(() => {
+      const flight = flightNow();
+      end("timeout", `wall-clock limit ${s.timeoutMs / 1000}s${flight && !flight.unknown ? `; tool ${flight.label} was in flight for ${secs(Date.now() - flight.since)}` : ""}`);
+    }, s.timeoutMs);
+
+    // What is in flight now: a tool call the event stream showed starting (Claude Code), else what OpenCode's
+    // service last said about this session. OpenCode's stream names a tool only when it has ended, so a job that
+    // went silent inside a step is asked (`session.messages`) every `probeEvery`; any new event voids the answer.
+    const probeEvery = Math.min(PROBE_MS, Math.max(250, s.idleMs / 2));
+    const probe = { busy: false, at: 0, flight: null, answered: -1 };
+    const askFlight = () => {
+      const asked = s.lastEvent;
+      probe.busy = true;
+      ocApi("session.messages", [`sessionID=${s.session}`, "limit=3", "order=desc", "type=assistant"], 8000)
+        .then(
+          (data) => findRunningTool(data),
+          () => ({ unknown: true, label: "a tool call (OpenCode could not say which)", since: asked }),
+        )
+        .then((flight) => {
+          probe.busy = false;
+          probe.at = Date.now();
+          if (asked !== s.lastEvent) return;
+          probe.flight = flight;
+          probe.answered = asked;
+        });
+    };
+    const flightNow = () => acc.flights.values().next().value || probe.flight || null;
+    const mark = () => {
+      const now = Date.now();
+      acc.peakIdle = Math.max(acc.peakIdle, now - s.lastEvent);
+      s.lastEvent = now;
+      probe.flight = null;
+    };
+
+    // once a second: write changed progress for other instances, honour a cancel request, check the idle limit
     let dirty = false;
     const idleTimer = setInterval(() => {
+      const now = Date.now();
+      const quietMs = now - s.lastEvent;
+      if (!claude && s.session && acc.stepOpen && !acc.flights.size && !probe.busy && quietMs >= probeEvery && now - probe.at >= probeEvery) askFlight();
+      const flight = flightNow();
+      if ((s.inFlight?.label || "") !== (flight?.label || "")) {
+        s.inFlight = flight ? { label: flight.label, since: flight.since } : null;
+        dirty = true;
+      }
       if (dirty) {
         dirty = false;
         saveState(s);
       }
       if (cancelAsked(s.id)) return end("cancelled", "stopped by opencode_cancel from another session");
-      if (Date.now() - s.lastEvent > s.idleMs) end("timeout", `no output for ${s.idleMs / 1000}s`);
+      const verdict = idleVerdict({ quietMs, idleMs: s.idleMs, toolIdleMs: s.toolIdleMs, flight });
+      // the first answer about this silence is due within seconds: decide with it
+      if (verdict.expired && !(probe.busy && probe.answered !== s.lastEvent)) end("timeout", idleReason({ limitMs: verdict.limitMs, flight, now }));
     }, 1000);
 
     let pending = "";
     child.stdout.on("data", (d) => {
       log.write(d);
-      s.lastEvent = Date.now();
+      mark();
       pending += d;
       const lines = pending.split(/\r?\n/);
       pending = lines.pop();
@@ -987,7 +1176,7 @@ function runAgent(job, { prompt, directory, files = [], allow_edits = false, age
     });
     child.stderr.on("data", (d) => {
       acc.stderr = (acc.stderr + d).slice(-4000);
-      s.lastEvent = Date.now();
+      mark();
     });
     child.on("error", (e) => {
       acc.errors.push(`spawn failed: ${e.message}`);
@@ -1009,9 +1198,11 @@ function runAgent(job, { prompt, directory, files = [], allow_edits = false, age
       clearTimeout(wallTimer);
       clearInterval(idleTimer);
       log.end();
-      const footer = s.session
-        ? `\n\n---\nsession: ${s.session} (pass as \`session\` to continue this conversation) · cost $${acc.cost.toFixed(4)}${claude ? "" : ` · reasoning ${acc.reasoning} tok`}`
-        : "";
+      s.inFlight = null;
+      const footer =
+        "\n\n---\n" +
+        (s.session ? `session: ${s.session} (pass as \`session\` to continue this conversation) · cost $${acc.cost.toFixed(4)}${claude ? "" : ` · reasoning ${acc.reasoning} tok`}\n` : "") +
+        `stats: ${stats(job, acc)}`;
       // the cap keeps the footer: cut the body, then append it
       resolve(finish(job, "done", cap(text, MAX_REPLY - footer.length, s.log) + footer, true));
     });
@@ -1047,9 +1238,11 @@ function progress(s) {
   const since = s.status === "queued" ? `queued${s.waiting ? ` (${s.waiting})` : ""}` : `running ${Math.round((now - (s.running || s.started)) / 1000)}s`;
   const quiet = s.lastEvent ? `, last output ${Math.round((now - s.lastEvent) / 1000)}s ago` : "";
   const tool = s.lastTool ? `, last tool ${s.lastTool}` : "";
+  const flight = s.inFlight ? `, in flight: ${s.inFlight.label} for ${secs(now - s.inFlight.since)}` : "";
   const files = s.files?.length ? `, ${s.files.length} file(s) edited` : "";
   const retry = s.retry ? `, provider retrying (${s.retry})` : "";
-  return `${s.id} still ${since}${quiet}${tool}${files}${retry} (limit ${s.timeoutMs / 1000}s, idle ${s.idleMs / 1000}s)`;
+  const note = s.note ? `, NOTE: ${s.note}` : "";
+  return `${s.id} still ${since}${quiet}${tool}${flight}${files}${retry}${note} (limit ${s.timeoutMs / 1000}s, idle ${s.idleMs / 1000}s, ${(s.toolIdleMs || s.idleMs) / 1000}s with a tool in flight)`;
 }
 const NO_NOTICE = "No notification will come: call opencode_result again now to keep waiting.";
 function progressOne(s) {
@@ -1059,7 +1252,6 @@ function progressOne(s) {
 // ---- opencode_list: every queued and running job on this machine, read from the shared state folder ----
 
 const clock = (ms) => new Date(ms).toTimeString().slice(0, 8);
-const secs = (ms) => `${Math.max(0, Math.round(ms / 1000))}s`;
 
 function pendingStates() {
   const out = new Map();
@@ -1126,12 +1318,51 @@ function poolLines() {
   );
 }
 
-function listText() {
+// Sessions OpenCode is still executing although no listed job runs them: what a stopped job may have left behind.
+async function busyLines(states) {
+  if (!existsSync(OPENCODE_EXE) && isAbsolute(OPENCODE_EXE)) return [];
+  const active = await activeSessions();
+  if (!active) return ["Sessions still busy: OpenCode could not be asked."];
+  const running = new Set(states.map((s) => s.session).filter(Boolean));
+  const left = active.filter((id) => !running.has(id));
+  if (!left.length) return ["Sessions still busy without a job: none."];
+  // which ended job each belongs to (sessions this bridge never ran, such as the user's own, are not listed)
+  const owners = new Map();
+  try {
+    for (const f of readdirSync(STATE_DIR)) {
+      if (!/^job_[a-z0-9]+_\d+\.json$/.test(f)) continue;
+      const raw = readFileSync(join(STATE_DIR, f), "utf8");
+      const ses = /"session":"([^"]+)"/.exec(raw)?.[1];
+      if (!ses || !left.includes(ses)) continue;
+      const s = JSON.parse(raw);
+      if (!owners.has(ses) || s.started > owners.get(ses).started) owners.set(ses, s);
+    }
+  } catch {
+    // a file being rewritten: the next call sees it
+  }
+  if (!owners.size) return ["Sessions still busy without a job: none."];
+  return [
+    "Sessions still busy without a job (a tool of the ended job may still run; opencode_cancel on that job interrupts it):",
+    ...[...owners].map(([ses, s]) => `${ses} · ${s.id} ${s.status}${s.finished ? ` ${secs(Date.now() - s.finished)} ago` : ""}`),
+  ];
+}
+
+async function listText() {
   const states = pendingStates();
   const queued = states.filter((s) => s.status === "queued");
   const lines = states.length ? states.map((s) => listLine(s, queued)) : ["No job is queued or running."];
-  return [...lines, "", "Places:", ...poolLines()].join("\n");
+  return [...lines, "", "Places:", ...poolLines(), "", ...(await busyLines(states))].join("\n");
 }
+
+// A stopped job's session may still be running inside OpenCode: interrupt it (again) and say how it stands.
+async function stopLeftover(s) {
+  const ses = ocSession(s);
+  if (!ses) return "";
+  const user = pendingStates().find((p) => p.session === ses && p.id !== s.id);
+  if (user) return `its session ${ses} is in use by ${user.id}; cancel that job to stop it`;
+  return resumeNote({ session: ses, ...(await stopSession(ses)) });
+}
+const resumeLine = (reply) => /^resume: .*$/m.exec(reply || "")?.[0] || "";
 
 // Stops a job from any session. Returns [text, isError].
 async function cancelJob(id) {
@@ -1151,34 +1382,35 @@ async function cancelJob(id) {
     }
     if (s.status === "running") {
       found.job.cancel?.();
-      await Promise.race([found.job.promise, sleep(20000)]);
-      return [`${id} stopped (process tree ${s.childPid} killed). Edits it made stay on disk${session}.`];
+      await Promise.race([found.job.promise, sleep(25000)]);
+      return [`${id} stopped (process tree ${s.childPid} killed). Edits it made stay on disk${session}.\n${resumeLine(s.reply)}`.trim()];
     }
-    return [`${id} already ${s.status}`];
-  }
-  if (s.status === "lost") {
+  } else if (s.status === "lost") {
     // its server is gone: stop what is left of it and free its places
     if (alive(s.childPid)) killPidTree(s.childPid);
     const freed = freeSlots(id);
-    return [`${id} stopped (its server is gone; process tree ${s.childPid} killed)${freed ? `; ${freed} held place(s) in the queue freed` : ""}${session}.`];
-  }
-  if (isPending(s)) {
+    const left = await stopLeftover(s);
+    return [`${id} stopped (its server is gone; process tree ${s.childPid} killed)${freed ? `; ${freed} held place(s) in the queue freed` : ""}${session}.\n${left}`.trim()];
+  } else if (isPending(s)) {
     // owned by another live instance: ask it, so the job ends the same way as with its own cancel
     askCancel(id);
     let now = s;
-    for (const until = Date.now() + 5000; Date.now() < until && isPending(now); ) {
+    for (const until = Date.now() + (s.status === "running" ? 25000 : 5000); Date.now() < until && isPending(now); ) {
       await sleep(250);
       now = readState(id) || now;
     }
-    if (!isPending(now)) return [`${id} ${now.status} by its own server (pid ${s.owner}). Edits it made stay on disk${session}.`];
+    if (!isPending(now)) return [`${id} ${now.status} by its own server (pid ${s.owner}). Edits it made stay on disk${session}.\n${resumeLine(now.reply)}`.trim()];
     // no answer: a server from before cancel requests, or one that is stuck
     if (s.status === "running") {
       if (alive(s.childPid)) killPidTree(s.childPid);
-      return [`${id}: its server (pid ${s.owner}) did not answer the cancel request, so process tree ${s.childPid} was killed directly${session}.`];
+      const left = await stopLeftover(s);
+      return [`${id}: its server (pid ${s.owner}) did not answer the cancel request, so process tree ${s.childPid} was killed directly${session}.\n${left}`.trim()];
     }
     return [`${id} is queued in server pid ${s.owner}, which did not answer the cancel request within 5 s (an older version of the server?). The request stays in place and is honoured when that server next looks.`, true];
   }
-  return [`${id} already ${s.status}`];
+  // already ended: its session may still be running in OpenCode all the same
+  const left = s.status === "done" ? "" : await stopLeftover(s);
+  return [`${id} already ${s.status}${left ? `\n${left}` : ""}`];
 }
 
 // Shown in the client's system prompt even while the tools are deferred. Claude Code's own background tasks
@@ -1202,7 +1434,7 @@ async function handle(msg) {
       result: {
         protocolVersion: params?.protocolVersion || "2025-06-18",
         capabilities: { tools: { listChanged: true } },
-        serverInfo: { name: "opencode-agent", version: "2.3.2" },
+        serverInfo: { name: "opencode-agent", version: "2.4.0" },
         instructions: SERVER_INSTRUCTIONS,
       },
     });
@@ -1269,7 +1501,7 @@ async function handle(msg) {
       return reply([...parts, lines.join("\n")].join("\n\n"));
     }
     if (params?.name === CANCEL_TOOL.name) return reply(...(await cancelJob(a.job)));
-    if (params?.name === LIST_TOOL.name) return reply(listText());
+    if (params?.name === LIST_TOOL.name) return reply(await listText());
     return send({ jsonrpc: "2.0", id, error: { code: -32602, message: `unknown tool ${params?.name}` } });
   }
   if (method === "ping") return send({ jsonrpc: "2.0", id, result: {} });
@@ -1278,7 +1510,7 @@ async function handle(msg) {
 
 // Stop this instance's running jobs when the session closes, so no build is left behind.
 function shutdown() {
-  for (const j of jobs.values()) if (j.state.status === "running") j.cancel?.();
+  for (const j of jobs.values()) if (j.state.status === "running") j.cancel?.(true);
   setTimeout(() => process.exit(0), 300);
 }
 
