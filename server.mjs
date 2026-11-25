@@ -101,6 +101,10 @@ const MIN = 60 * 1000;
 // A full build or test run inside one tool call can be silent for many minutes, so the idle limit is generous.
 const TIMEOUT_MS = Number(process.env.OPENCODE_TIMEOUT_MS || 60 * MIN);
 const IDLE_MS = Number(process.env.OPENCODE_IDLE_MS || 20 * MIN);
+// While a tool call is in flight (a shell running a build) silence is expected, so a longer idle limit applies.
+const TOOL_IDLE_MS = Number(process.env.OPENCODE_TOOL_IDLE_SECONDS || 45 * 60) * 1000;
+// OpenCode's event stream reports a tool call only when it ends: a silent job is asked this often what it is doing.
+const PROBE_MS = Math.max(250, Number(process.env.OPENCODE_PROBE_MS || 30000));
 const MAX_TIMEOUT_MS = 4 * 60 * MIN;
 const MAX_CONCURRENT = Math.max(1, Number(process.env.OPENCODE_MAX_CONCURRENT || 10));
 const MAX_REPLY = Number(process.env.OPENCODE_MAX_REPLY_CHARS || 20000);
@@ -248,6 +252,12 @@ async function limited(job, local, fn) {
   let all = null, own = null;
   try {
     while (!job.cancelled) {
+      // another session's opencode_cancel reaches a queued job through its cancel file
+      if (cancelAsked(job.state.id)) {
+        job.cancelled = true;
+        finish(job, "cancelled", "cancelled before it started (asked by another session)");
+        break;
+      }
       own = local ? tryTake(local, LOCAL_CONCURRENT, job.state.id) : null;
       if (!local || own) {
         all = tryTake("all", MAX_CONCURRENT, job.state.id);
@@ -260,11 +270,13 @@ async function limited(job, local, fn) {
         (who.length ? `: ${who.join(", ")}. opencode_cancel on one of these ids frees its place` : "");
       if (job.state.waiting !== why) {
         job.state.waiting = why;
+        job.state.waitPool = local && !own ? local : "all";
         saveState(job.state);
       }
       await sleep(1000);
     }
     job.state.waiting = "";
+    job.state.waitPool = "";
     return await fn();
   } finally {
     release(all);
@@ -649,12 +661,20 @@ const RESULT_TOOL = {
 const CANCEL_TOOL = {
   name: "opencode_cancel",
   description:
-    "Stop a running job and its whole process tree (builds and tests it started included). Edits it already made stay on disk; its session can be continued later.",
+    "Stop a queued or running job from any session (any id `opencode_list` shows) and its whole process tree (builds and tests it started included). Edits it already made stay on disk; its session can be continued later.",
   inputSchema: {
     type: "object",
     properties: { job: { type: "string", description: "The job id to stop." } },
     required: ["job"],
   },
+};
+
+const LIST_TOOL = {
+  name: "opencode_list",
+  description:
+    "Lists every queued and running job on this machine, from all sessions: id, owner process (alive or gone), model, state, start time, running time, last tool, " +
+    "queue place, and which jobs hold the places of each pool. Any listed id can be passed to `opencode_cancel`.",
+  inputSchema: { type: "object", properties: {} },
 };
 
 // ---- job state, shared through STATE_DIR ----
@@ -668,6 +688,25 @@ const delivered = new Set(); // jobs whose reply a multi-job result call already
 const statePath = (id) => join(STATE_DIR, `${id}.json`);
 const logPath = (id) => join(STATE_DIR, `${id}.jsonl`);
 const validId = (id) => typeof id === "string" && /^job_[a-z0-9]+_\d+$/.test(id);
+// A cancel asked from another server instance: a file the job's owner looks for once a second.
+const cancelPath = (id) => join(STATE_DIR, `${id}.cancel`);
+const cancelAsked = (id) => existsSync(cancelPath(id));
+function askCancel(id) {
+  try {
+    writeFileSync(cancelPath(id), String(process.pid));
+    return true;
+  } catch {
+    return false;
+  }
+}
+function clearCancel(id) {
+  try {
+    unlinkSync(cancelPath(id));
+  } catch {
+    // none was asked
+  }
+}
+const isPending = (s) => s.status === "running" || s.status === "queued";
 
 function saveState(state) {
   const tmp = `${statePath(state.id)}.${process.pid}.tmp`;
@@ -816,6 +855,7 @@ function finish(job, status, reply, ok = false) {
   s.finished = Date.now();
   saveState(s);
   releaseJob(s.id);
+  clearCancel(s.id);
   return s;
 }
 
@@ -924,6 +964,7 @@ function runAgent(job, { prompt, directory, files = [], allow_edits = false, age
         dirty = false;
         saveState(s);
       }
+      if (cancelAsked(s.id)) return end("cancelled", "stopped by opencode_cancel from another session");
       if (Date.now() - s.lastEvent > s.idleMs) end("timeout", `no output for ${s.idleMs / 1000}s`);
     }, 1000);
 
@@ -1015,6 +1056,131 @@ function progressOne(s) {
   return `${progress(s)}. ${NO_NOTICE}`;
 }
 
+// ---- opencode_list: every queued and running job on this machine, read from the shared state folder ----
+
+const clock = (ms) => new Date(ms).toTimeString().slice(0, 8);
+const secs = (ms) => `${Math.max(0, Math.round(ms / 1000))}s`;
+
+function pendingStates() {
+  const out = new Map();
+  let names = [];
+  try {
+    names = readdirSync(STATE_DIR);
+  } catch {
+    // no state folder: only this instance's jobs
+  }
+  for (const f of names) {
+    if (!/^job_[a-z0-9]+_\d+\.json$/.test(f) || jobs.has(f.slice(0, -5))) continue;
+    try {
+      const raw = readFileSync(join(STATE_DIR, f), "utf8");
+      if (!/"status":"(running|queued)"/.test(raw)) continue; // finished jobs are most of the folder
+      const s = JSON.parse(raw);
+      if (isPending(s)) out.set(s.id, s);
+    } catch {
+      // being rewritten
+    }
+  }
+  for (const j of jobs.values()) if (isPending(j.state)) out.set(j.state.id, j.state);
+  return [...out.values()].sort((a, b) => a.started - b.started);
+}
+
+const poolName = (pool) => (pool === "all" ? "the machine" : `local model ${allModels().find((m) => m.local && localPool(m.ref) === pool)?.ref || pool}`);
+const poolSize = (pool) => (pool === "all" ? MAX_CONCURRENT : LOCAL_CONCURRENT);
+
+// One line per job. `queued` is every queued job, oldest first: a job's place is its rank among those waiting for the same pool.
+export function listLine(s, queued, now = Date.now()) {
+  const owner = `owner pid ${s.owner} ${alive(s.owner) ? "alive" : "GONE (opencode_cancel frees its place)"}`;
+  const head = `${s.id} ${s.status} · ${s.model || "model?"} · ${owner} · started ${clock(s.started)}`;
+  if (s.status === "queued") {
+    if (!s.waitPool) return `${head} · queued ${secs(now - s.started)}, about to start`;
+    const peers = queued.filter((q) => q.waitPool === s.waitPool);
+    return `${head} · queued ${secs(now - s.started)}, place ${peers.indexOf(s) + 1}/${peers.length} waiting for ${poolName(s.waitPool)}`;
+  }
+  const flight = s.inFlight ? ` · in flight: ${s.inFlight.label} for ${secs(now - s.inFlight.since)}` : "";
+  return (
+    `${head} · running ${secs(now - (s.running || s.started))} · last tool ${s.lastTool || "(none)"} · last output ${secs(now - (s.lastEvent || s.started))} ago` +
+    `${flight}${s.session ? ` · session ${s.session}` : ""}`
+  );
+}
+
+function poolLines() {
+  const pools = new Map([["all", { live: [], stale: 0 }]]);
+  let names = [];
+  try {
+    names = readdirSync(SLOT_DIR);
+  } catch {
+    // no slot folder
+  }
+  for (const f of names) {
+    const path = join(SLOT_DIR, f);
+    const info = slotInfo(path);
+    if (!info) continue;
+    const pool = f.replace(/\.\d+$/, "");
+    if (!pools.has(pool)) pools.set(pool, { live: [], stale: 0 });
+    if (slotStale(path)) pools.get(pool).stale++;
+    else pools.get(pool).live.push(info.job || "unknown job");
+  }
+  return [...pools].map(
+    ([pool, p]) =>
+      `${poolName(pool)}: ${p.live.length}/${poolSize(pool)} places held${p.live.length ? ` by ${p.live.join(", ")}` : ""}${p.stale ? ` (+${p.stale} stale, freed on the next take)` : ""}`,
+  );
+}
+
+function listText() {
+  const states = pendingStates();
+  const queued = states.filter((s) => s.status === "queued");
+  const lines = states.length ? states.map((s) => listLine(s, queued)) : ["No job is queued or running."];
+  return [...lines, "", "Places:", ...poolLines()].join("\n");
+}
+
+// Stops a job from any session. Returns [text, isError].
+async function cancelJob(id) {
+  const found = current(id);
+  if (!found) {
+    // not a job this server can find, but it may still hold a place in the queue
+    const freed = validId(id) ? freeSlots(id) : 0;
+    return freed ? [`${id} has no record; its ${freed} held place(s) in the queue are freed`] : [`unknown job ${id}`, true];
+  }
+  const s = found.state;
+  const session = s.session ? `; session ${s.session}` : "";
+  if (found.job) {
+    if (s.status === "queued") {
+      found.job.cancelled = true;
+      finish(found.job, "cancelled", "cancelled before it started");
+      return [`${id} cancelled before it started`];
+    }
+    if (s.status === "running") {
+      found.job.cancel?.();
+      await Promise.race([found.job.promise, sleep(20000)]);
+      return [`${id} stopped (process tree ${s.childPid} killed). Edits it made stay on disk${session}.`];
+    }
+    return [`${id} already ${s.status}`];
+  }
+  if (s.status === "lost") {
+    // its server is gone: stop what is left of it and free its places
+    if (alive(s.childPid)) killPidTree(s.childPid);
+    const freed = freeSlots(id);
+    return [`${id} stopped (its server is gone; process tree ${s.childPid} killed)${freed ? `; ${freed} held place(s) in the queue freed` : ""}${session}.`];
+  }
+  if (isPending(s)) {
+    // owned by another live instance: ask it, so the job ends the same way as with its own cancel
+    askCancel(id);
+    let now = s;
+    for (const until = Date.now() + 5000; Date.now() < until && isPending(now); ) {
+      await sleep(250);
+      now = readState(id) || now;
+    }
+    if (!isPending(now)) return [`${id} ${now.status} by its own server (pid ${s.owner}). Edits it made stay on disk${session}.`];
+    // no answer: a server from before cancel requests, or one that is stuck
+    if (s.status === "running") {
+      if (alive(s.childPid)) killPidTree(s.childPid);
+      return [`${id}: its server (pid ${s.owner}) did not answer the cancel request, so process tree ${s.childPid} was killed directly${session}.`];
+    }
+    return [`${id} is queued in server pid ${s.owner}, which did not answer the cancel request within 5 s (an older version of the server?). The request stays in place and is honoured when that server next looks.`, true];
+  }
+  return [`${id} already ${s.status}`];
+}
+
 // Shown in the client's system prompt even while the tools are deferred. Claude Code's own background tasks
 // (run_in_background, background subagents) notify the session when they end; these jobs never do, and a session
 // that treats them that way waits for nothing or polls now and then with sleep, Monitor or wakeups.
@@ -1048,7 +1214,7 @@ async function handle(msg) {
   if (method === "tools/list") {
     // first run in this folder: wait (bounded) for the live list; otherwise the cache answers at once
     if (!catalog && refreshing) await Promise.race([refreshing, new Promise((r) => setTimeout(r, 10000))]);
-    return send({ jsonrpc: "2.0", id, result: { tools: [buildTool(), RESULT_TOOL, CANCEL_TOOL] } });
+    return send({ jsonrpc: "2.0", id, result: { tools: [buildTool(), RESULT_TOOL, CANCEL_TOOL, LIST_TOOL] } });
   }
   if (method === "tools/call") {
     const reply = (text, isError = false) => send({ jsonrpc: "2.0", id, result: { content: [{ type: "text", text }], isError } });
@@ -1102,35 +1268,8 @@ async function handle(msg) {
       lines.push(left ? `${left} still running. ${NO_NOTICE}` : "All done.");
       return reply([...parts, lines.join("\n")].join("\n\n"));
     }
-    if (params?.name === CANCEL_TOOL.name) {
-      const found = current(a.job);
-      if (!found) {
-        // not a job this server can find, but it may still hold a place in the queue
-        const freed = validId(a.job) ? freeSlots(a.job) : 0;
-        return freed ? reply(`${a.job} has no record; its ${freed} held place(s) in the queue are freed`) : reply(`unknown job ${a.job}`, true);
-      }
-      const s = found.state;
-      if (found.job) {
-        if (s.status === "queued") {
-          found.job.cancelled = true;
-          finish(found.job, "cancelled", "cancelled before it started");
-          return reply(`${a.job} cancelled before it started`);
-        }
-        if (s.status === "running") {
-          found.job.cancel?.();
-          return reply(`${a.job} stopped (process tree ${s.childPid} killed). Edits it made stay on disk${s.session ? `; session ${s.session}` : ""}.`);
-        }
-        return reply(`${a.job} already ${s.status}`);
-      }
-      if (s.status === "running" || s.status === "lost") {
-        // owned by another instance (or orphaned): stop the process tree; the owner records the end
-        if (alive(s.childPid)) killPidTree(s.childPid);
-        const freed = !alive(s.owner) ? freeSlots(a.job) : 0;
-        return reply(`${a.job} stopped (process tree ${s.childPid} killed)${freed ? `; ${freed} held place(s) in the queue freed` : ""}${s.session ? `; session ${s.session}` : ""}.`);
-      }
-      if (s.status === "queued") return reply(`${a.job} is queued in another server instance; cancel it from that session`, true);
-      return reply(`${a.job} already ${s.status}`);
-    }
+    if (params?.name === CANCEL_TOOL.name) return reply(...(await cancelJob(a.job)));
+    if (params?.name === LIST_TOOL.name) return reply(listText());
     return send({ jsonrpc: "2.0", id, error: { code: -32602, message: `unknown tool ${params?.name}` } });
   }
   if (method === "ping") return send({ jsonrpc: "2.0", id, result: {} });
