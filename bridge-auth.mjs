@@ -3,7 +3,7 @@
 import { spawn } from "node:child_process";
 import { readFileSync, existsSync } from "node:fs";
 import { dirname } from "node:path";
-import { api, configModel, environment, findOpencode, integrations, paths, pruneArchived, signInStatus, targetArgs, using, workerFile } from "./job-service.mjs";
+import { api, availableProviders, configModel, environment, findOpencode, integrations, paths, pruneArchived, signInStatus, targetArgs, using, workerFile } from "./job-service.mjs";
 
 const [action, provider, ...extra] = process.argv.slice(2);
 const valid = /^[A-Za-z0-9][A-Za-z0-9_.-]*$/;
@@ -16,6 +16,7 @@ async function main() {
   await using(async svc => {
     if (action === "status") {
       const rows = await integrations(svc, cwd);
+      const available = await availableProviders(svc,cwd);
       const file = existsSync(workerFile) ? JSON.parse(readFileSync(workerFile, "utf8")) : {};
       const workers = file.workers ?? { default: { runs: "opencode", agent: process.env.OPENCODE_AGENT || "deepseek-flash" } };
       const names = new Set();
@@ -30,7 +31,7 @@ async function main() {
       }
       // Project only public state; integration connection labels/addresses are not needed.
       console.log(JSON.stringify({ personal: file.magicContextInJobs === true, providers: [...names].sort().map(id => ({
-        id, status: signInStatus(rows, id), key: !!svc && !!rows.find(r => r.id === id)?.methods?.some(m => m.type === "key"),
+        id, status: signInStatus(rows, id, available), key: !!svc && !!rows.find(r => r.id === id)?.methods?.some(m => m.type === "key"),
         stored: !!rows.find(r => r.id === id)?.connections?.some(c => c.type === "credential"),
       })) }));
       return;

@@ -52,7 +52,7 @@ async function main() {
         data: [
           { providerID: "fake", id: "model", type: "chat", status: "active", variants: [{ id: "low" }, { id: "high" }], cost: [{ input: 1, output: 1 }], settings: {} },
           { providerID: "lan", id: "local", type: "chat", status: "active", variants: [], cost: [], settings: { baseURL: "http://127.0.0.1:9/v1" } },
-        ],
+        ].filter(m => !existsSync(missing) || m.providerID !== readFileSync(missing,"utf8")),
       });
     if (op === "agent.list")
       return out({ data: [{ id: "deepseek-flash", mode: "primary", description: "Fake agent.", model: { providerID: "fake", id: "model" }, permissions: [{ action: "edit", resource: "*", effect: "ask" }, { action: "shell", resource: "*", effect: "ask" }] }] });
@@ -142,6 +142,10 @@ async function main() {
   if (cmd === "auth") {
     if (rest.includes("--format")) return out(rows().filter(r => r.connections.length));
     appendFileSync(join(dir,"auth.log"), JSON.stringify({action:rest[0], provider:rest[1], db})+"\n");
+    return;
+  }
+  if (cmd === "models") {
+    operation("model.list",{},r=>process.stdout.write(r.data.map(m=>`${m.providerID}/${m.id}`).join("\n")));
     return;
   }
   if (cmd === "api") {

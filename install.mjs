@@ -174,7 +174,8 @@ try {
     const cwd = personal ? homedir() : dirname(profile.paths.OPENCODE_DB);
     const opts = { env: personal ? process.env : profile.environment(svc, cwd), cwd };
     const signed = () => JSON.parse(execFileSync(opencode, ["auth","list","--format","json",...target], { ...opts, timeout:20000, encoding:"utf8" }))
-      .some(row => row.id === "deepseek" && row.connections?.some(c => personal || c.type === "credential"));
+      .some(row => row.id === "deepseek" && row.connections?.length) ||
+      execFileSync(opencode, ["models",...target], { ...opts, timeout:20000, encoding:"utf8" }).split(/\r?\n/).includes("deepseek/deepseek-flash");
     if (!signed() && process.argv.includes("--signin"))
       execFileSync(opencode, ["auth","login","deepseek",...target], { ...opts, stdio:"inherit" });
     if (!signed()) return warn(personal ? "Sign in with opencode auth login deepseek." : "Sign in for DeepSeek in Config Studio › Workers, or run node bridge-auth.mjs login deepseek.");

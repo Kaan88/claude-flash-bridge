@@ -80,6 +80,23 @@ const inside = (dir, file) => {
   const p = relative(dir, file);
   return !p || !(p === ".." || p.startsWith(`..${sep}`) || isAbsolute(p));
 };
+// Keep literal provider keys in the user's original config only. OpenCode
+// expands the references in its private server, just like user-written {env:...}.
+function providerSecrets(cfg, name) {
+  const values={};
+  function visit(obj, path) {
+    if (!obj || typeof obj!=="object") return;
+    for (const [k,v] of Object.entries(obj)) {
+      const parts=[...path,k];
+      if (typeof v==="string" && /^(apiKey|api[_-]key|x-api-key|authorization|authToken|accessToken|password)$/i.test(k) && v && !/^\{(?:env|file):[^}]+\}$/.test(v)) {
+        const key="BRIDGE_PROVIDER_"+createHash("sha256").update(JSON.stringify([name,...parts])).digest("hex").slice(0,24);
+        values[key]=v; obj[k]=`{env:${key}}`;
+      } else visit(v,parts);
+    }
+  }
+  for (const k of ["providers","provider"]) visit(cfg[k],[k]);
+  return values;
+}
 function snapshot() {
   const files = new Map(), digest = createHash("sha256").update(JSON.stringify([src, dst]));
   function walk(dir, prefix, parents = new Set()) {
@@ -98,8 +115,10 @@ function snapshot() {
       if (/^opencode\.jsonc?$/.test(name)) {
         let cfg;
         try { cfg = parseConfig(bytes.toString()); } catch { throw Error(`Could not parse ${name} for workers.`); }
-        const lean = withoutMagic(cfg);
-        if (lean) bytes = Buffer.from(JSON.stringify(lean, null, 2) + "\n");
+        const lean = withoutMagic(cfg), doc=lean || cfg;
+        const values=providerSecrets(doc,name);
+        digest.update(JSON.stringify(values));
+        if (lean || Object.keys(values).length) bytes = Buffer.from(JSON.stringify(doc, null, 2) + "\n");
       }
       digest.update(JSON.stringify([name, bytes.length])).update(bytes);
       files.set(name, bytes);
@@ -122,11 +141,19 @@ function install(snap, previous) {
     writeFileSync(tmp, bytes, { mode: 0o600 }); renameSync(tmp, file);
   }
 }
-export function environment(svc, cwd) {
+export function environment(svc, cwd, loadKeys=!svc) {
   const env = { ...process.env, ...paths, PWD: cwd };
   // Credentials for this connection only; don't inherit a calling OpenCode client's endpoint.
   for (const key of ["OPENCODE_PASSWORD", "OPENCODE_SERVER_PASSWORD", "OPENCODE_SESSION_ID", "OPENCODE_CONFIG", "OPENCODE_CONFIG_CONTENT"]) delete env[key];
+  if (svc || !loadKeys) for (const k of Object.keys(env))
+    if (/(_API_KEY|_AUTH_TOKEN|_ACCESS_TOKEN)$|^BRIDGE_PROVIDER_/i.test(k)) delete env[k];
   if (svc) env.OPENCODE_PASSWORD = svc.password;
+  if (loadKeys) for (const name of ["opencode.json","opencode.jsonc"]) {
+    const file=join(src,name);
+    if (!existsSync(file)) continue;
+    try { Object.assign(env,providerSecrets(parseConfig(readFileSync(file,"utf8")),name)); }
+    catch { /* a malformed edit can still use the last installed worker config */ }
+  }
   return env;
 }
 export const targetArgs = svc => svc ? ["--server", svc.url] : ["--standalone"];
@@ -247,11 +274,20 @@ export async function warm(svc, cwd) {
     await delay(50);
   }
 }
-export function signInStatus(rows, provider) {
+// `auth list` excludes providers supplied solely by config. Consult the
+// warmed model catalog before refusing one, including project overrides.
+export async function availableProviders(svc,cwd) {
+  if (svc) return new Set((await api(svc,`/api/model?directory=${encodeURIComponent(cwd)}`)).data.map(m=>m.providerID));
+  const {stdout}=await promisify(execFile)(exe,["models","--standalone"],{cwd,env:environment(null,cwd),timeout:20000,windowsHide:true,maxBuffer:8e6});
+  return new Set(stdout.split(/\r?\n/).filter(l=>l.includes("/")).map(l=>l.split("/")[0]));
+}
+export function signInStatus(rows, provider, available) {
   const row = rows.find(r => r.id === provider);
+  if (row?.connections?.some(c=>c.type==="env")) return "Signed in via environment";
   const selected = row?.connections?.find(c => c.type === "credential");
   if (selected?.status?.status === "needs_auth") return "Sign in again";
   if (selected) return "Signed in";
+  if (available?.has(provider)) return "No sign-in required";
   if (row?.methods?.length || row?.connections?.length || ["openai", "deepseek", "anthropic"].includes(provider)) return "Missing";
   return "No sign-in required";
 }

@@ -1297,10 +1297,11 @@ async function missingSignIn(svc, model, cwd) {
   const provider = model.split("/")[0];
   if (!provider || findModel(model)?.local || findModel(model)?.free) return "";
   const rows = await profile.integrations(svc, cwd);
-  const status = profile.signInStatus(rows, provider);
+  const available = await profile.availableProviders(svc,cwd);
+  const status = profile.signInStatus(rows, provider, available);
   // The standalone auth list contains only connected integrations. A remote worker
   // still needs an actionable error when its provider is absent from that list.
-  if (status !== "Missing" && status !== "Sign in again" && (svc || rows.some(r => r.id === provider))) return "";
+  if (status !== "Missing" && status !== "Sign in again" && (svc || available.has(provider) || rows.some(r => r.id === provider))) return "";
   const helper = fileURLToPath(new URL("./bridge-auth.mjs", import.meta.url));
   return `Worker provider "${provider}" ${status === "Sign in again" ? "needs a fresh sign-in" : "has no sign-in"}. Sign in for workers in OpenCode Config Studio › Workers, or run: node "${helper}" login ${provider}`;
 }
