@@ -15,7 +15,7 @@ import { createHash } from "node:crypto";
 import { createWriteStream, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, statSync, unlinkSync, utimesSync, watchFile, writeFileSync } from "node:fs";
 import { createInterface } from "node:readline";
 import { homedir, tmpdir } from "node:os";
-import { delimiter, isAbsolute, join } from "node:path";
+import { delimiter, isAbsolute, join, resolve } from "node:path";
 
 // The npm shim (opencode.cmd / opencode.ps1) mangles stdin, so find the real binary next to it.
 function findOpencode() {
@@ -83,7 +83,7 @@ export function readWorker(name, w, legacy = false) {
   if (runs !== "opencode" || typeof w.agent !== "string" || !w.agent) return null;
   return { ...base, agent: w.agent, model: typeof w.model === "string" ? w.model.replace(/#.*$/, "") : "", effort: typeof w.effort === "string" ? w.effort : "" };
 }
-let workersCache = { key: "", list: {}, def: "" };
+let workersCache = { key: "", list: {}, def: "", accounts: [], use: "same" };
 function workerSet() {
   const mtime = mtimeOf(WORKERS_FILE);
   const legacy = mtime ? 0 : mtimeOf(LEGACY_WORKERS_FILE);
@@ -91,9 +91,13 @@ function workerSet() {
   if (key === workersCache.key) return workersCache;
   let list = {};
   let def = "";
+  let accounts = [];
+  let use = "same";
   try {
     if (mtime) {
       const raw = JSON.parse(readFileSync(WORKERS_FILE, "utf8"));
+      accounts = Array.isArray(raw.claudeAccounts) ? raw.claudeAccounts.filter((d) => typeof d === "string" && d) : [];
+      use = typeof raw.claudeWorkersUse === "string" && raw.claudeWorkersUse ? raw.claudeWorkersUse : "same";
       for (const [name, w] of Object.entries(raw.workers || {})) {
         const entry = readWorker(name, w);
         if (entry) list[name] = entry;
@@ -110,9 +114,9 @@ function workerSet() {
     // no default named: the first OpenCode worker (work that leaves the Claude plan alone), else the first one
     def ||= Object.values(list).find((w) => w.runs === "opencode")?.name || Object.keys(list)[0] || "";
   } catch {
-    ({ list, def } = workersCache); // half-written or invalid: keep the last good list
+    ({ list, def, accounts, use } = workersCache); // half-written or invalid: keep the last good list
   }
-  workersCache = { key, list, def };
+  workersCache = { key, list, def, accounts, use };
   return workersCache;
 }
 // The Claude Code workers alone, by name (what `agent` could name before there was one list).
@@ -122,10 +126,49 @@ const isClaudeJob = (a) =>
   a._w ? a._w.runs === "claude" : String(a.model || "").startsWith(`${CLAUDE_PROVIDER}/`) || CLAUDE_SESSION.test(String(a.session || "")) || !!(a.agent && workers()[a.agent]);
 // What a read-only Claude job may do: read, search, look things up, and run read-only git commands.
 const CLAUDE_READ_TOOLS = ["Read", "Grep", "Glob", "WebFetch", "WebSearch", "Bash(git status*)", "Bash(git diff*)", "Bash(git log*)", "Bash(git show*)"];
-// The host session's CLAUDE_* variables would tie the worker to it (its session id, messaging socket): drop them.
+// Which Claude account a Claude Code worker runs on, for someone with several (workers.json: "claudeAccounts", the
+// accounts' config folders with the standard one first, and "claudeWorkersUse": "same", "other" or one of the
+// folders). The answer is the folder to pass as CLAUDE_CONFIG_DIR; "" means the standard login (~/.claude).
+// "same" is the host session's own folder. "other" is the first account that is not the host's: the host is known by
+// its account id when the app gave one (a desktop session of any account uses the standard folder, so the folder
+// alone would not tell), else by its folder. With nothing to choose from the answer is the host's.
+const sameDir = (a, b) => resolve(a).toLowerCase() === resolve(b).toLowerCase();
+export function workerConfigDir({ accounts = [], use = "same", hostDir = "", hostUuid = "", uuidOf = () => "", home = homedir() } = {}) {
+  const standard = join(home, ".claude");
+  const out = (dir) => (!dir || sameDir(dir, standard) ? "" : dir);
+  const host = hostDir || standard;
+  if (!accounts.length) return out(host);
+  const byUuid = hostUuid ? accounts.find((d) => uuidOf(d) === hostUuid) : undefined;
+  if (use === "same") return out(byUuid || host);
+  if (use !== "other") return accounts.some((d) => sameDir(d, use)) ? out(use) : out(host);
+  const mine = byUuid || accounts.find((d) => sameDir(d, host));
+  const other = accounts.find((d) => !(mine && sameDir(d, mine)) && !(hostUuid && uuidOf(d) === hostUuid));
+  return out(other || host);
+}
+// The account id a config folder is signed in as: "oauthAccount.accountUuid" of its .claude.json (which for the
+// standard folder lies beside it). Only that one value is read; the login itself is never opened.
+function accountUuidOf(dir) {
+  try {
+    const file = sameDir(dir, join(homedir(), ".claude")) ? join(homedir(), ".claude.json") : join(dir, ".claude.json");
+    return String(JSON.parse(readFileSync(file, "utf8")).oauthAccount?.accountUuid || "");
+  } catch {
+    return "";
+  }
+}
+// The host session's CLAUDE_* variables would tie the worker to it (its session id, messaging socket, and in the
+// desktop app its login): drop them, then name the account's folder.
 function claudeEnv(cwd) {
   const env = { ...process.env, PWD: cwd };
   for (const k of Object.keys(env)) if (/^CLAUDE/i.test(k)) delete env[k];
+  const { accounts, use } = workerSet();
+  const dir = workerConfigDir({
+    accounts,
+    use,
+    hostDir: process.env.CLAUDE_CONFIG_DIR || "",
+    hostUuid: process.env.CLAUDE_CODE_ACCOUNT_UUID || "",
+    uuidOf: accountUuidOf,
+  });
+  if (dir) env.CLAUDE_CONFIG_DIR = dir;
   return env;
 }
 // Read-only jobs run without --auto, so an agent whose edits and shell commands are "ask" can't change anything:
@@ -1811,7 +1854,7 @@ const send = (msg) => process.stdout.write(JSON.stringify(msg) + "\n");
 // What this client offers, kept for opencode_list and in clients.jsonl: whether a client can take a long job as an
 // MCP task (the io.modelcontextprotocol/tasks extension) is known only from what it sends.
 const TASKS_EXT = "io.modelcontextprotocol/tasks";
-const VERSION = "3.1.0";
+const VERSION = "3.2.0";
 
 // ---- MCP tasks (OPENCODE_TASKS=1) ----
 // With protocol 2026-07-28 and the tasks extension a client takes a long job as a task: opencode_run returns at
@@ -1830,6 +1873,10 @@ const TASK_INSTRUCTIONS =
   "Start every job you need, then carry on with other work or end the turn. Do not wait for a job in any way: no `opencode_result` loop, " +
   "sleep, Monitor, ScheduleWakeup or subagent. `opencode_result` with `wait_seconds: 0` only looks at what a job is doing.";
 // The run tool's opening, which says how to wait, reworded for a client that takes the job as a task.
+// What a look at a running task job ends with, and how soon a second look gets only that.
+const TASK_WAIT = "Its reply is delivered to you when it ends. Do not look again: carry on with other work, or end the turn if nothing else is left.";
+const LOOK_AGAIN_MS = Math.max(0, Number(process.env.OPENCODE_LOOK_AGAIN_MS || 60000));
+const looked = new Map();
 const taskDescription = (d) =>
   d.replace(/^.*? as `jobs`. /s, () => "Hands a task to a worker (another model working on its own) as a background task: the call returns at once, and the job's reply, with its session id, is delivered to you when the job ends. Do not call `opencode_result` to wait for it. ");
 const iso = (ms) => new Date(ms || Date.now()).toISOString();
@@ -1964,7 +2011,17 @@ async function handle(msg) {
       const fresh = (jid) => ids.length === 1 || !delivered.has(jid);
       const ready = () => ids.some((jid) => found.get(jid) && !pending(found.get(jid).state) && fresh(jid));
       const anyPending = () => ids.some((jid) => found.get(jid) && pending(found.get(jid).state));
-      const most = waitLimit();
+      // A client that takes jobs as tasks is handed each reply by itself: a call here never waits, and looking at
+      // the same running jobs again within a minute gets one line, so a loop of looks has nothing to feed on.
+      const asTask = modern && offersTasks(params);
+      if (asTask && !ready() && anyPending()) {
+        const running = ids.filter((jid) => found.get(jid) && pending(found.get(jid).state));
+        const now = Date.now();
+        const again = running.every((jid) => now - (looked.get(jid) || 0) < LOOK_AGAIN_MS);
+        for (const jid of running) if (!again) looked.set(jid, now);
+        if (again) return reply(`${running.join(", ")} still running. ${TASK_WAIT}`);
+      }
+      const most = asTask ? 0 : waitLimit();
       const asked = Number(a.wait_seconds);
       const until = Date.now() + Math.max(0, Math.min(most, a.wait_seconds === undefined || !Number.isFinite(asked) ? most : asked)) * 1000;
       // a progress message now and then: the caller's user sees what the jobs are doing, and a client that ends a
@@ -1987,7 +2044,8 @@ async function handle(msg) {
       if (cancelledCalls.delete(id)) return;
       if (ids.length === 1) {
         const s = found.get(ids[0]).state;
-        if (pending(s)) return reply(progressOne(s));
+        if (pending(s)) return reply(asTask ? `${progressOne(s)}
+${TASK_WAIT}` : progressOne(s));
         return reply(s.reply || `${ids[0]} ${s.status}`, !s.ok);
       }
       const parts = [];
@@ -2003,7 +2061,7 @@ async function handle(msg) {
         }
       }
       const left = ids.filter((jid) => found.get(jid) && pending(found.get(jid).state)).length;
-      lines.push(left ? `${left} still running. ${NO_NOTICE}` : "All done.");
+      lines.push(left ? `${left} still running. ${asTask ? TASK_WAIT : NO_NOTICE}` : "All done.");
       return reply([...parts, lines.join("\n")].join("\n\n"));
     }
     if (params?.name === CANCEL_TOOL.name) return reply(...(await cancelJob(a.job)));

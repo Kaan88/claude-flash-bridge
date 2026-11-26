@@ -58,6 +58,22 @@ written for older versions that name a worker with `agent` still run; `model: "c
 longer do. `OPENCODE_ALLOW_ANY=1` brings the old behaviour back: every OpenCode model and agent is listed and can be
 asked for with `model` and `agent`.
 
+### Several Claude accounts
+
+Claude Code workers run on the standard login (`~/.claude`) unless `workers.json` says otherwise with two top-level
+keys:
+
+```json
+{ "claudeAccounts": ["C:/Users/me/.claude", "C:/Users/me/.claude-accounts/work/cli"],
+  "claudeWorkersUse": "other" }
+```
+
+`claudeAccounts` are the accounts' config folders (what `CLAUDE_CONFIG_DIR` names), the standard one first.
+`claudeWorkersUse` is `"same"` (the account of the session that started the job; the default), `"other"` (the first
+account that is not that one, so workers spend the plan you are not working on) or one of the folders (always that
+account). A session of the desktop app is told apart by its account id, since it uses the standard folder whichever
+account it is signed in to. The bridge reads only `oauthAccount.accountUuid` from each folder's `.claude.json`.
+
 For an OpenCode worker the bridge reads the agent's model and its effort levels from OpenCode
 (`opencode api model.list` / `agent.list`, cached per project folder), so `effort` is checked per model and a wrong
 level is refused with the valid ones. `OPENCODE_MODEL_EXCLUDE` and the blocklist file still switch a model off for

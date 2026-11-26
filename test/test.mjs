@@ -572,6 +572,15 @@ await test("with OPENCODE_TASKS a job is an MCP task: the run returns at once an
 
   // a task that is cancelled ends with what it left, as its result
   const long = (await t.rpc("tools/call", { name: "opencode_run", arguments: { prompt: "FAKE:hang:60000" }, ...meta() })).result;
+  // looking at a running task never waits; the first look says what it is doing, a second one only "do not look"
+  const before = Date.now();
+  const look = () => t.rpc("tools/call", { name: "opencode_result", arguments: { job: long.taskId }, ...meta() });
+  const first = (await look()).result.content[0].text;
+  assert.match(first, /Its reply is delivered to you when it ends\. Do not look again/);
+  assert.ok(first.split("\n").length > 1, first);
+  const second = (await look()).result.content[0].text;
+  assert.equal(second, `${long.taskId} still running. Its reply is delivered to you when it ends. Do not look again: carry on with other work, or end the turn if nothing else is left.`);
+  assert.ok(Date.now() - before < 3000, "a look does not wait");
   assert.deepEqual((await t.rpc("tasks/cancel", { taskId: long.taskId, ...meta() })).result, { resultType: "complete" });
   const gone = (await t.rpc("tasks/get", { taskId: long.taskId, ...meta() })).result;
   assert.equal(gone.status, "completed");
@@ -579,10 +588,37 @@ await test("with OPENCODE_TASKS a job is an MCP task: the run returns at once an
   assert.match(gone.result.content[0].text, /^status: cancelled/);
 
   // the older protocol still works on the same server
-  assert.equal((await t.start()).serverInfo.version, "3.1.0");
+  assert.equal((await t.start()).serverInfo.version, "3.2.0");
   t.stop();
 });
 
+await test("a Claude worker's account follows the setting: same, other, or a named folder", () => {
+  const home = join(root, "home");
+  const std = join(home, ".claude");
+  const work = join(home, ".claude-accounts", "work", "cli");
+  const accounts = [std, work];
+  const uuidOf = (d) => (d === std ? "uuid-main" : d === work ? "uuid-work" : "");
+  const pick = (o) => bridge.workerConfigDir({ accounts, home, uuidOf, ...o });
+  // "" is the standard login, with no CLAUDE_CONFIG_DIR at all
+  assert.equal(pick({ use: "same" }), "");
+  assert.equal(pick({ use: "same", hostDir: work }), work);
+  assert.equal(pick({ use: "same", hostUuid: "uuid-work" }), work);
+  assert.equal(pick({ use: "same", hostUuid: "uuid-unknown" }), "");
+  assert.equal(pick({ use: "other" }), work);
+  assert.equal(pick({ use: "other", hostDir: work }), "");
+  // a desktop session of the second account runs on the standard folder: its account id tells
+  assert.equal(pick({ use: "other", hostUuid: "uuid-work" }), "");
+  assert.equal(pick({ use: "other", hostUuid: "uuid-main" }), work);
+  assert.equal(pick({ use: "other", hostUuid: "uuid-unknown" }), work);
+  assert.equal(pick({ use: work }), work);
+  assert.equal(pick({ use: std.toUpperCase(), hostDir: work }), "");
+  // a folder that is not one of the accounts is not used
+  assert.equal(pick({ use: join(home, "elsewhere"), hostDir: work }), work);
+  // nothing to choose from: the host's own
+  assert.equal(bridge.workerConfigDir({ accounts: [], use: "other", hostDir: work, home }), work);
+  assert.equal(bridge.workerConfigDir({ accounts: [std], use: "other", home, uuidOf }), "");
+  assert.equal(bridge.workerConfigDir(), "");
+});
 await test("the wait is 50 s unless set, and a worker entry is read strictly", () => {
   assert.equal(bridge.serviceDropped(['{"type":"unknown","message":"Transport: ECONNRESET: The socket connection was closed unexpectedly."}']), true);
   assert.equal(bridge.serviceDropped(['{"name":"APIError","message":"Insufficient balance"}', ""]), false);
