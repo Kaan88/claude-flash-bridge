@@ -5,7 +5,7 @@ import assert from "node:assert/strict";
 import { execFile, spawn } from "node:child_process";
 import { promisify } from "node:util";
 import { randomBytes } from "node:crypto";
-import { copyFileSync, existsSync, linkSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { copyFileSync, existsSync, linkSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { delimiter, dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -666,6 +666,10 @@ await test("two bridges share one worker service, defer config changes until idl
   writeFileSync(join(ocDir, "opencode.json"), JSON.stringify({ plugins: ["@cortexkit/opencode-magic-context@latest"], compaction: { auto: false } }));
   writeFileSync(join(ocDir, "cli.json"), "{}");
   writeFileSync(join(ocDir, "service.json"), "{}");
+  const definitions=join(root,"linked-definitions"); mkdirSync(definitions);
+  symlinkSync(definitions,join(ocDir,"skills"),"junction");
+  symlinkSync(ocDir,join(definitions,"cycle"),"junction");
+  writeFileSync(join(definitions,"SKILL.md"),"linked skill");
   const dir = join(root,"lean-fake");
   const runLog = () => readFileSync(join(dir, "run.log"), "utf8").trim().split("\n").map((l) => JSON.parse(l));
   const env = { FAKE_DIR:dir, OPENCODE_CONFIG_DIR: ocDir, BRIDGE_JOB_CONFIG_DIR: jobs, BRIDGE_JOB_HOME:join(root,"lean-profile") };
@@ -691,6 +695,8 @@ await test("two bridges share one worker service, defer config changes until idl
   assert.deepEqual(JSON.parse(readFileSync(join(jobs, "opencode.json"), "utf8")), { compaction: { auto: true } });
   assert.ok(existsSync(join(jobs, "cli.json")), "the other config files come along");
   assert.ok(!existsSync(join(jobs, "service.json")), "the service's password does not");
+  assert.equal(readFileSync(join(jobs,"skills","SKILL.md"),"utf8"),"linked skill");
+  assert.ok(!existsSync(join(jobs,"skills","cycle")));
   const keep = join(root, "keep-workers.json");
   writeFileSync(keep, JSON.stringify({ magicContextInJobs: true, workers: { w: { runs: "opencode", agent: "deepseek-flash" } } }));
   const kept = new Server("state-kept", { ...env, OPENCODE_ALLOW_ANY: "", BRIDGE_WORKERS_FILE: keep });

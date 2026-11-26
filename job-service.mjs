@@ -2,7 +2,7 @@
 // coordinator. Never let automatic CLI discovery start, replace or stop a managed service.
 import { execFile, spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { createServer } from "node:net";
 import { homedir } from "node:os";
 import { basename, delimiter, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
@@ -69,7 +69,7 @@ function parseConfig(text) {
   return JSON.parse(text.replace(/^\uFEFF/, "").replace(strings, s => s[0] === '"' ? s : " ")
     .replace(/"(?:\\.|[^"\\])*"|,(?=\s*[}\]])/g, s => s === "," ? "" : s));
 }
-const skip = /^(service(?:-[\w-]+)?\.json|node_modules|\.git)$|\.(bak|backup)|\.lock$/i;
+const skip = /^(auth\.json|service(?:-[\w-]+)?\.json|node_modules|\.git)$|\.(bak|backup)|\.lock$|\.(db|sqlite)(-wal|-shm)?$/i;
 function canonical(file) {
   if (existsSync(file)) return realpathSync.native(file);
   const parent = dirname(file);
@@ -82,12 +82,18 @@ const inside = (dir, file) => {
 };
 function snapshot() {
   const files = new Map(), digest = createHash("sha256").update(JSON.stringify([src, dst]));
-  function walk(dir, prefix) {
+  function walk(dir, prefix, parents = new Set()) {
+    const real = canonical(dir);
+    if (parents.has(real) || [root,dst].some(p=>inside(canonical(p),real) || (prefix && inside(real,canonical(p))))) return;
+    parents = new Set([...parents, real]);
     for (const e of readdirSync(dir, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name))) {
       const name = join(prefix, e.name), file = join(dir, e.name);
       if (skip.test(e.name)) continue;
-      if (e.isDirectory()) { walk(file, name); continue; }
-      if (!e.isFile()) continue;
+      const entry = e.isSymbolicLink() ? statSync(file, {throwIfNoEntry:false}) : e;
+      if (e.isSymbolicLink() && entry && (skip.test(basename(canonical(file))) ||
+          [root,dst].some(dir=>inside(canonical(dir),canonical(file))))) continue;
+      if (entry?.isDirectory()) { walk(file, name, parents); continue; }
+      if (!entry?.isFile()) continue;
       let bytes = readFileSync(file);
       if (/^opencode\.jsonc?$/.test(name)) {
         let cfg;
