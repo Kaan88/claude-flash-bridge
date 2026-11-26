@@ -86,6 +86,11 @@ Your own OpenCode sessions keep the plugin. `"magicContextInJobs": true` in `wor
 The copy lives in `~/.config/opencode-bridge/opencode-jobs` (`BRIDGE_JOB_CONFIG_DIR`). An `opencode.jsonc` config
 is not rewritten: jobs then use the service as before.
 
+Not measured yet: each running job is now its own OpenCode server, so memory grows per job (before, a job was a
+small client of the one shared service) and a job takes a few seconds longer to start. If that turns out to cost too
+much, the alternative (owner, 2026-11-26) is a second, permanent OpenCode service for jobs only, started with the
+plugin-free config: one fixed cost instead of one per job, but one more background service to keep running.
+
 For an OpenCode worker the bridge reads the agent's model and its effort levels from OpenCode
 (`opencode api model.list` / `agent.list`, cached per project folder), so `effort` is checked per model and a wrong
 level is refused with the valid ones. `OPENCODE_MODEL_EXCLUDE` and the blocklist file still switch a model off for
