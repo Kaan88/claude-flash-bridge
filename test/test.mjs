@@ -4,6 +4,7 @@
 import assert from "node:assert/strict";
 import { execFile, spawn } from "node:child_process";
 import { promisify } from "node:util";
+import { birth } from "../process-identity.mjs";
 import { randomBytes } from "node:crypto";
 import { copyFileSync, existsSync, linkSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -749,6 +750,37 @@ await test("unavailable service falls back to standalone with worker DB; sign-in
   srv.stop();
 });
 
+await test("shutdown interrupts all held sessions even with coordinator admission blocked",async()=>{
+  const dir=join(root,"close-fake"), home=join(root,"close-profile");
+  const srv=new Server("close-state",{FAKE_DIR:dir,BRIDGE_JOB_HOME:home});
+  const lock=join(home,"job-service","admission","test-holder");
+  try {
+    const ids=await Promise.all(Array.from({length:5},()=>srv.run({prompt:"FAKE:hang:60000"})));
+    const sessions=await until("all sessions recorded",()=>{
+      const states=ids.map(id=>JSON.parse(readFileSync(join(root,"close-state",id+".json"))));
+      return states.every(s=>s.status==="running" && s.session) && states.map(s=>s.session);
+    });
+    writeFileSync(lock,JSON.stringify({pid:process.pid,birth:await birth(process.pid),ticket:1}));
+    const exit=new Promise(ok=>srv.child.once("exit",ok));
+    srv.stop(); await Promise.race([exit,sleep(10000)]);
+    assert.equal(srv.child.exitCode,0);
+    for (const id of sessions) assert.ok(!existsSync(join(dir,"active",id)),`session ${id} left running`);
+  } finally { rmSync(lock,{force:true}); if (srv.child.exitCode===null) srv.child.kill(); }
+});
+await test("refuses a duplicate resume and routes pre-upgrade leftovers to personal mode",async()=>{
+  const dir=join(root,"resume-fake"), state=join(root,"resume-check-state");
+  const srv=new Server("resume-check-state",{FAKE_DIR:dir,BRIDGE_JOB_HOME:join(root,"resume-profile")});
+  try {
+    const result=await srv.result(await srv.run({prompt:"FAKE:busy:1"}));
+    assert.ok(result.isError); assert.equal(readFileSync(join(dir,"run.log"),"utf8").trim().split("\n").length,1);
+    const ses="ses_fake999";
+    writeFileSync(join(state,"job_old_1.json"),JSON.stringify({id:"job_old_1",owner:process.pid,started:1,running:1,finished:2,status:"failed",session:ses,magicContext:false}));
+    assert.match((await srv.result(await srv.run({prompt:"FAKE:quick",session:ses}))).text,/personal database/);
+    const active=join(dir,"active",ses); writeFileSync(active,JSON.stringify({scope:"personal"}));
+    await srv.call("opencode_cancel",{job:"job_old_1"}); assert.ok(!existsSync(active));
+  } finally { srv.stop(); }
+});
+
 for (const pid of strays) {
   try {
     process.kill(pid);
@@ -758,7 +790,7 @@ for (const pid of strays) {
 }
 await sleep(500);
 // Only the fakes with a registration created in this test's unique scratch root.
-for (const folder of ["workers","lean-profile","signin-profile"]) {
+for (const folder of ["workers","lean-profile","signin-profile","close-profile","resume-profile"]) {
   const file = join(root,folder,"job-service","state","opencode","service.json");
   if (!existsSync(file)) continue;
   const svc = JSON.parse(readFileSync(file,"utf8"));

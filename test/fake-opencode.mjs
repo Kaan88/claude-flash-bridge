@@ -183,13 +183,14 @@ async function main() {
   };
 
   const dropFile = join(dir, "drop", ses);
-  if (kind === "drop") writeFileSync(dropFile, arg);
+  if (kind === "drop" || kind === "busy") writeFileSync(dropFile, arg);
   if (!existsSync(active)) writeFileSync(active, JSON.stringify({scope})); // a session an earlier run left busy stays as it is
   ev("step_start", { type: "step-start" });
   const drops = existsSync(dropFile) ? Number(readFileSync(dropFile, "utf8")) : 0;
   if (drops > 0) {
     writeFileSync(dropFile, String(drops - 1));
-    rmSync(active, { force: true }); // the service that ran it is gone
+    if (kind==="busy") writeFileSync(active,JSON.stringify({scope,stubborn:true}));
+    else rmSync(active, { force: true }); // the service that ran it is gone
     out({ type: "error", timestamp: Date.now(), sessionID: ses, error: { type: "unknown", message: "Transport: ECONNRESET: The socket connection was closed unexpectedly." } });
     await new Promise((r) => process.stdout.write("", r));
     process.exit(1);

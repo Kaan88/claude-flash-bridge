@@ -14,6 +14,7 @@ import { execFile, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { createWriteStream, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, statSync, unlinkSync, utimesSync, watchFile, writeFileSync } from "node:fs";
 import * as profile from "./job-service.mjs";
+import { birth, ownsPort } from "./process-identity.mjs";
 import { fileURLToPath } from "node:url";
 export { withoutMagic } from "./job-service.mjs";
 import { createInterface } from "node:readline";
@@ -152,6 +153,8 @@ function accountUuidOf(dir) {
 // desktop app its login): drop them, then name the account's folder.
 function claudeEnv(cwd) {
   const env = { ...process.env, PWD: cwd };
+  delete env.OPENCODE_PASSWORD;
+  delete env.OPENCODE_SERVER_PASSWORD;
   for (const k of Object.keys(env)) if (/^CLAUDE/i.test(k)) delete env[k];
   const { accounts, use } = workerSet();
   const dir = workerConfigDir({
@@ -468,16 +471,23 @@ const SERVICE_OPS = {
   "session.message.list": ({ sessionID, ...q }) => ["GET", `/api/session/${encodeURIComponent(sessionID)}/message?${new URLSearchParams(q)}`],
 };
 // The answer, or null when the service can't be asked this way (then the CLI is). Throws when it does not answer.
-async function ocService(op, params, timeout) {
-  const route = SERVICE_OPS[op];
-  if (!route) return null;
+async function ownerEndpoint() {
   let svc;
   try {
     svc = JSON.parse(readFileSync(SERVICE_FILE, "utf8"));
   } catch {
     return null;
   }
-  if (!svc?.url || !svc.password) return null;
+  if (!svc?.password || !/^http:\/\/127\.0\.0\.1:\d+$/.test(svc.url) ||
+      !await ownsPort(svc.pid, Number(new URL(svc.url).port))) return null;
+  const stamp=await birth(svc.pid);
+  return stamp ? {...svc,birth:stamp} : null;
+}
+async function ocService(op, params, timeout) {
+  const route = SERVICE_OPS[op];
+  if (!route) return null;
+  const svc=await ownerEndpoint();
+  if (!svc) return null;
   const [method, path] = route(Object.fromEntries(params.map((p) => p.split(/=(.*)/s).slice(0, 2))));
   const res = await fetch(svc.url + path, {
     method,
@@ -492,7 +502,8 @@ async function ocService(op, params, timeout) {
 
 async function ocApi(op, params = [], timeout = 20000, mode = workerSet().magic ? "owner" : "worker") {
   if (mode === "standalone") throw Error("A private fallback run has no shared session API.");
-  if (mode === "worker") return profile.using(async svc => {
+  if (mode === "worker" || typeof mode === "object") {
+    const query = async svc => {
     const route = SERVICE_OPS[op];
     if (!svc && op.startsWith("session.")) throw Error("Worker session service is unavailable.");
     if (svc && route) {
@@ -501,7 +512,9 @@ async function ocApi(op, params = [], timeout = 20000, mode = workerSet().magic 
       return result.data ?? result;
     }
     return ocCli(op, params, timeout, svc);
-  });
+    };
+    return typeof mode === "object" ? query(mode) : profile.using(query);
+  }
   const direct = await ocService(op, params, timeout);
   return direct ? direct.data : ocCli(op, params, timeout);
 }
@@ -851,13 +864,12 @@ function workerEfforts() {
   return levels.length ? levels : FALLBACK_EFFORTS;
 }
 // The worker that ran a session, from the jobs this machine remembers (newest first).
-function workerOfSession(session) {
+function previousSession(session, exclude) {
   let best = null;
   const see = (s) => {
-    if (s?.session === session && s.worker && (!best || s.started > best.started)) best = s;
+    if (s?.session === session && s.id !== exclude && s.status !== "queued" && (s.running || s.serviceMode || s.magicContext !== undefined) && (!best || s.started > best.started)) best = s;
   };
   for (const j of jobs.values()) see(j.state);
-  if (!best)
     try {
       for (const f of readdirSync(STATE_DIR)) {
         if (!/^job_[a-z0-9]+_\d+\.json$/.test(f)) continue;
@@ -867,7 +879,7 @@ function workerOfSession(session) {
     } catch {
       // a file being rewritten: the default worker is tried instead
     }
-  return best?.worker;
+  return best;
 }
 // Resolves a call to one worker and rewrites its arguments to what that worker runs. Returns an error text or "".
 // `worker` names it; a call written for an older version may name a worker with `agent`; a continued session goes
@@ -882,7 +894,7 @@ function useWorker(a) {
   if (name === undefined && (a.agent || a.model))
     return `${a.model ? `model "${a.model}"` : `agent "${a.agent}"`} is not a worker. This bridge runs only the workers its user set up; pick one with \`worker\`. ${offer}`;
   if (a.worker !== undefined && a.model) return `\`model\` is not accepted: worker "${name}" decides what it runs on. ${offer}`;
-  if (name === undefined && a.session) name = workerOfSession(a.session);
+  if (name === undefined && a.session) name = previousSession(a.session)?.worker;
   if (name === undefined || !list[name]) name = def;
   const w = list[name];
   if (!w) return `no worker is set up. ${offer}`;
@@ -1166,7 +1178,8 @@ function clampMs(seconds, fallback, max) {
 function killPidTree(pid) {
   if (!pid) return;
   if (process.platform === "win32") {
-    spawn("taskkill", ["/PID", String(pid), "/T", "/F"], { windowsHide: true, stdio: "ignore" });
+    spawn(join(process.env.SystemRoot,"System32","taskkill.exe"), ["/PID", String(pid), "/T", "/F"],
+      { windowsHide: true, stdio: "ignore", env:{SystemRoot:process.env.SystemRoot} });
   } else {
     try {
       process.kill(-pid, "SIGKILL"); // the child is spawned detached, so it leads its own group
@@ -1428,8 +1441,17 @@ function absorbClaude(job, acc, ev) {
 async function runAgent(job, args) {
   let lease;
   try {
+    let checkSession=false;
+    if (args.session && !isClaudeJob(args)) {
+      const earlier = previousSession(args.session,job.state.id);
+      // Before 3.4 even --standalone used the personal DB.
+      if (earlier && ((earlier.serviceMode ?? "owner") === "owner") !== workerSet().magic)
+        return finish(job,"failed",`This session belongs to the ${earlier.serviceMode && earlier.serviceMode !== "owner" ? "worker" : "personal"} database. Switch the Workers Context setting back to continue it, or start a new session.`);
+      checkSession=!earlier;
+    }
     if (!isClaudeJob(args) && !workerSet().magic) {
       lease = await profile.acquire();
+      job.state.profileNote=lease.note;
       const cwd = args.directory && existsSync(args.directory) ? resolve(args.directory) : process.cwd();
       let ref = args.model;
       if (lease.svc) {
@@ -1447,6 +1469,13 @@ async function runAgent(job, args) {
       const missing = await missingSignIn(lease.svc, ref, cwd);
       if (missing) return finish(job, "failed", missing);
       if (args.effort && !args.model) args.model = ref; // use the same project model that we checked
+    }
+    if (checkSession) {
+      try {
+        const entry=lease?.svc ? (await profile.api(lease.svc,`/api/session/${encodeURIComponent(args.session)}`)).data :
+          await ocCli("session.get",[`sessionID=${args.session}`],8000,lease?.svc);
+        if (entry?.id!==args.session) throw Error();
+      } catch { return finish(job,"failed","Could not verify this session in the selected OpenCode database. Check the Workers Context setting or start a new session."); }
     }
     if (job.cancelled || cancelAsked(job.state.id)) return finish(job, "cancelled", "cancelled before it started");
     return await runClient(job, args, lease);
@@ -1488,11 +1517,13 @@ function runClient(job, { prompt, directory, files = [], allow_edits = false, ag
       const ref = model || (effort ? resolveModel({ agent, allow_edits }) : "");
       s.serviceMode = lease ? (lease.svc ? "worker" : "standalone") : "owner";
       s.magicContext = !lease;
+      const title=lease?.svc ? `claude-delegate ${s.id}` : "claude-delegate";
+      lease?.starting(title,session);
       ocArgs = (ses, attach) => {
         const a = ["run", "--format", "json", "--archived", "--agent", chosen];
         if (lease) a.push(...profile.targetArgs(lease.svc));
         if (ses) a.push("--session", ses);
-        else a.push("--title", "claude-delegate");
+        else a.push("--title", title);
         if (ref) a.push("--model", effort ? `${ref}#${effort}` : ref);
         if (allow_edits) a.push("--auto");
         for (const f of attach) a.push("--file", f);
@@ -1507,6 +1538,12 @@ function runClient(job, { prompt, directory, files = [], allow_edits = false, ag
     const log = createWriteStream(s.log);
     let child;
     const cwd = directory && existsSync(directory) ? directory : process.cwd();
+    let personal;
+    const rememberOwner=()=>{
+      if (!claude && !lease && !personal)
+        personal=ownerEndpoint().catch(()=>null).then(svc=>{ if (!svc) personal=null; return svc; });
+      return personal;
+    };
     const start = (withArgs) =>
       spawn(exe, withArgs, {
         cwd,
@@ -1523,15 +1560,17 @@ function runClient(job, { prompt, directory, files = [], allow_edits = false, ag
       return resolve(finish(job, "failed", `spawn failed: ${e.message}`));
     }
     job.child = child;
+    lease?.bindClient(child.pid).catch(()=>child.kill());
     s.status = "running";
     s.childPid = child.pid;
     s.running = Date.now();
     s.lastEvent = Date.now();
+    rememberOwner();
     saveState(s);
 
     // continuing a session whose earlier run never stopped would wait behind it without a word: say so
     if (!claude && session)
-      sessionBusy(session, s.serviceMode).then((busy) => {
+      sessionBusy(session, lease?.svc || s.serviceMode).then((busy) => {
         if (busy && !ended) {
           s.note = "its session was still busy with an earlier run when this job started; opencode_cancel on the earlier job interrupts that run";
           saveState(s);
@@ -1539,9 +1578,18 @@ function runClient(job, { prompt, directory, files = [], allow_edits = false, ag
       });
 
     let ended = false;
-    // `fast` (the server is closing): no time to wait for OpenCode's answer
+    // On close, send exactly one direct interrupt without entering admission.
+    const interruptOnClose=async()=>{
+      if (claude) return;
+      if (!s.session) { lease?.abandon(); return; }
+      try {
+        if (lease?.svc) await profile.interrupt(lease.svc,s.session);
+        else if (!lease) { const target=await rememberOwner(); if (target) await profile.interrupt(target,s.session); }
+      } catch { /* preserve the worker session for recovery */ }
+      lease?.abandon();
+    };
     const end = (status, reason, fast = false) => {
-      if (ended) return;
+      if (ended) return fast ? interruptOnClose() : undefined;
       ended = true;
       clearTimeout(wallTimer);
       clearInterval(idleTimer);
@@ -1551,10 +1599,14 @@ function runClient(job, { prompt, directory, files = [], allow_edits = false, ag
       const done =(note) => resolve(finish(job, status, summary(job, acc, status, reason, note)));
       // `opencode run` is a client of OpenCode's background service: the session and its tools (a build) run
       // there, so killing the client is not enough. Ask the service to interrupt the session, and report the outcome.
-      if (claude || !s.session) return done(resumeNote({ claude, session: s.session }));
-      const stopping = stopSession(s.session, s.serviceMode);
-      if (fast) return done(resumeNote({ session: s.session, interrupted: null, busy: null }));
-      stopping.then((r) => done(resumeNote({ session: s.session, ...r })));
+      if (fast) {
+        return interruptOnClose().then(()=>done(resumeNote({session:s.session,interrupted:null,busy:null})));
+      }
+      if (claude || !s.session) {
+        if (lease?.svc) lease.abandon();
+        return done(resumeNote({ claude, session: s.session }));
+      }
+      return stopSession(s.session, lease?.svc || s.serviceMode).then((r) => done(resumeNote({ session: s.session, ...r })));
     };
     job.cancel = (fast = false) => end("cancelled", fast ? "its Claude session closed" : "stopped by opencode_cancel", fast);
 
@@ -1571,7 +1623,7 @@ function runClient(job, { prompt, directory, files = [], allow_edits = false, ag
     const askFlight = () => {
       const asked = s.lastEvent;
       probe.busy = true;
-      sessionMessages(s.session, s.serviceMode)
+      sessionMessages(s.session, lease?.svc || s.serviceMode)
         .then(
           (data) => findRunningTool(data),
           () => ({ unknown: true, label: "a tool call (OpenCode could not say which)", since: asked }),
@@ -1628,17 +1680,21 @@ function runClient(job, { prompt, directory, files = [], allow_edits = false, ag
       saveState(s);
       await sleep(RESUME_WAIT_MS);
       if (ended) return;
-      if ((await sessionBusy(s.session, s.serviceMode)) === true) await stopSession(s.session, s.serviceMode);
-      if (ended) return;
       mark();
       try {
         if (lease?.svc) {
           const replacement = await profile.acquire();
+          if (!replacement.svc) { replacement.release(); throw Error("No worker session service to verify the earlier run."); }
           lease.release();
           Object.assign(lease, replacement);
-          s.serviceMode = lease.svc ? "worker" : "standalone";
+          lease.track(s.session);
           if (ended) { lease.release(); return; }
         }
+        const target=lease?.svc || s.serviceMode;
+        const busy=await sessionBusy(s.session,target);
+        if (busy===null || (busy && (await stopSession(s.session,target)).busy!==false))
+          throw Error("Previous run could not be confirmed idle.");
+        if (ended) return;
         child = start(ocArgs(s.session, []));
       } catch (e) {
         acc.errors.push(`spawn failed: ${e.message}`);
@@ -1662,6 +1718,8 @@ function runClient(job, { prompt, directory, files = [], allow_edits = false, ag
         if (!line.trim().startsWith("{")) continue;
         try {
           take(job, acc, JSON.parse(line));
+          if (s.session) rememberOwner();
+          if (s.session) lease?.track(s.session);
         } catch {
           // a non-JSON line: kept in the log only
         }
@@ -1699,7 +1757,7 @@ function runClient(job, { prompt, directory, files = [], allow_edits = false, ag
         "\n\n---\n" +
         (s.session ? `session: ${s.session} (pass as \`session\` to continue this conversation) · cost $${acc.cost.toFixed(4)}${claude ? "" : ` · reasoning ${acc.reasoning} tok`}\n` : "") +
         `stats: ${stats(job, acc)}` +
-        (s.resumed ? `\nnote: ${s.note}` : "");
+        (s.resumed ? `\nnote: ${s.note}` : "") + (s.profileNote ? `\nworker service: ${s.profileNote}` : "");
       // the cap keeps the footer: cut the body, then append it
       resolve(finish(job, "done", cap(text, MAX_REPLY - footer.length, s.log) + footer, true));
     });
@@ -1791,7 +1849,7 @@ export function listLine(s, queued, now = Date.now()) {
   const flight = s.inFlight ? ` · in flight: ${s.inFlight.label} for ${secs(now - s.inFlight.since)}` : "";
   return (
     `${head} · running ${secs(now - (s.running || s.started))} · last tool ${s.lastTool || "(none)"} · last output ${secs(now - (s.lastEvent || s.started))} ago` +
-    `${flight}${s.session ? ` · session ${s.session}` : ""}`
+    `${flight}${s.session ? ` · session ${s.session}` : ""}${s.profileNote ? ` · ${s.profileNote}` : ""}`
   );
 }
 
@@ -1878,7 +1936,7 @@ async function stopLeftover(s) {
   if (!ses) return "";
   const user = pendingStates().find((p) => p.session === ses && p.id !== s.id);
   if (user) return `its session ${ses} is in use by ${user.id}; cancel that job to stop it`;
-  return resumeNote({ session: ses, ...(await stopSession(ses, s.serviceMode)) });
+  return resumeNote({ session: ses, ...(await stopSession(ses, s.serviceMode ?? "owner")) });
 }
 const resumeLine = (reply) => /^resume: .*$/m.exec(reply || "")?.[0] || "";
 
@@ -2170,9 +2228,15 @@ ${TASK_WAIT}` : progressOne(s));
 }
 
 // Stop this instance's running jobs when the session closes, so no build is left behind.
-function shutdown() {
-  for (const j of jobs.values()) if (j.state.status === "running") j.cancel?.(true);
-  setTimeout(() => process.exit(0), 300);
+let closing=false;
+async function shutdown() {
+  if (closing) return;
+  closing=true;
+  await Promise.allSettled([...jobs.values()].map(j=>{
+    j.cancelled=true;
+    return j.state.status==="running" && j.cancel?.(true);
+  }));
+  process.exit(0);
 }
 
 // OPENCODE_BRIDGE_NO_MAIN=1 (the tests) loads this file for its functions without serving stdin.
