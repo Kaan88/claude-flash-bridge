@@ -14,6 +14,8 @@
 //   FAKE:unknown:<ms>   the same, but `session.messages` fails, so nobody can say which tool runs
 //   FAKE:daemon         a tool whose process belongs to "the service" and never ends; `session.interrupt` stops it
 //   FAKE:stubborn       the same, but the interrupt does not stop it and the session stays busy
+//   FAKE:drop:<n>       the service "restarts" under the run: a transport error and exit 1, for the first <n> runs
+//                       in the session; the run after those answers PONG
 import { execFileSync } from "node:child_process";
 import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { basename, join } from "node:path";
@@ -27,7 +29,7 @@ if (/^opencode(\.exe)?$/i.test(basename(process.execPath))) {
 async function main() {
   const dir = process.env.FAKE_DIR;
   const [cmd, ...rest] = [basename(process.argv[1] || ""), ...process.argv.slice(2)];
-  for (const d of ["active", "tool"]) mkdirSync(join(dir, d), { recursive: true });
+  for (const d of ["active", "tool", "drop"]) mkdirSync(join(dir, d), { recursive: true });
   const out = (o) => process.stdout.write(JSON.stringify(o) + "\n");
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   const readJson = (p) => JSON.parse(readFileSync(p, "utf8"));
@@ -62,7 +64,7 @@ async function main() {
       rmSync(join(dir, "tool", ses), { force: true });
       return out({ interrupted: true });
     }
-    if (op === "session.messages") {
+    if (op === "session.messages" || op === "session.message.list") {
       const file = join(dir, "tool", ses);
       if (!existsSync(file)) return out({ data: [{ type: "assistant", content: [{ type: "text", text: "thinking" }] }], cursor: {} });
       const tool = readJson(file);
@@ -97,8 +99,19 @@ async function main() {
     rmSync(toolFile, { force: true });
   };
 
+  const dropFile = join(dir, "drop", ses);
+  if (kind === "drop") writeFileSync(dropFile, arg);
   if (!existsSync(active)) writeFileSync(active, "{}"); // a session an earlier run left busy stays as it is
   ev("step_start", { type: "step-start" });
+  const drops = existsSync(dropFile) ? Number(readFileSync(dropFile, "utf8")) : 0;
+  if (drops > 0) {
+    writeFileSync(dropFile, String(drops - 1));
+    rmSync(active, { force: true }); // the service that ran it is gone
+    out({ type: "error", timestamp: Date.now(), sessionID: ses, error: { type: "unknown", message: "Transport: ECONNRESET: The socket connection was closed unexpectedly." } });
+    await new Promise((r) => process.stdout.write("", r));
+    process.exit(1);
+  }
+  if (kind === "drop") return finishStep("PONG");
   if (kind === "quick") {
     toolDone();
     return finishStep("PONG");

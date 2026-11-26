@@ -146,6 +146,8 @@ class Server {
         OPENCODE_BRIDGE_NO_MAIN: "",
         OPENCODE_CLAUDE: "0",
         OPENCODE_PROBE_MS: "500",
+        OPENCODE_SERVICE_FILE: join(root, "no-service.json"),
+        OPENCODE_RESUME_WAIT_MS: "200",
         OPENCODE_ALLOW_ANY: "1",
         BRIDGE_WORKERS_FILE: join(root, "no-workers.json"),
         CLAUDE_WORKERS_FILE: join(root, "no-claude-workers.json"),
@@ -220,6 +222,23 @@ await test("a job runs, and its reply ends with session and one stats line", asy
   const r = await one.result(job);
   assert.equal(r.isError, false, r.text);
   assert.match(r.text, /^PONG\n\n---\nsession: ses_fake\d+ .* · cost \$0\.0010 · reasoning 5 tok\nstats: 1 tool call · total \d+s · peak idle \d+s · last tool shell$/);
+});
+
+await test("a job whose connection OpenCode's service dropped goes on in the same session", async () => {
+  const job = await one.run({ prompt: "FAKE:drop:1" });
+  const r = await one.result(job);
+  assert.equal(r.isError, false, r.text);
+  assert.match(r.text, /^PONG\n\n---\nsession: ses_fake\d+ /);
+  assert.match(r.text, /\nnote: OpenCode's service dropped this job's connection once; it went on in the same session each time$/);
+});
+
+await test("after two such drops the job is given up, with the error and the session", async () => {
+  const job = await one.run({ prompt: "FAKE:drop:5" });
+  const r = await one.result(job);
+  assert.equal(r.isError, true);
+  assert.match(r.text, /^status: failed \(opencode exited 1\)/);
+  assert.match(r.text, /\nnote: OpenCode's service dropped this job's connection 2 times/);
+  assert.match(r.text, /\nerrors: .*Transport: ECONNRESET/);
 });
 
 await test("the plain idle limit ends a silent job with no tool in flight", async () => {
@@ -350,7 +369,7 @@ await test("opencode_list shows every session's jobs, and any of them can be can
 
   // its place is free: the job that waited now runs
   assert.match((await b.result(waits)).text, /^PONG/);
-  assert.match((await a.call("opencode_list")).text, /^No job is queued or running\.\n\nPlaces:\nthe machine: 0\/1 places held\n\nSessions still busy without a job: none\.\n\nWorkers: any OpenCode agent or model \(OPENCODE_ALLOW_ANY\)\n\nThis server: client "test", one opencode_result call waits up to 50 s\.$/);
+  assert.match((await a.call("opencode_list")).text, /^No job is queued or running\.\n\nPlaces:\nthe machine: 0\/1 places held\n\nSessions still busy without a job: none\.\n\nWorkers: any OpenCode agent or model \(OPENCODE_ALLOW_ANY\)\n\nThis server: client "test" 0, protocol 2025-06-18, MCP tasks not offered; one opencode_result call waits up to 50 s\.$/);
 });
 
 await test("a job whose server died is listed as gone, and cancelling it frees its place", async () => {
@@ -500,11 +519,73 @@ await test("a wait the client gave up on answers nothing and keeps the reply for
 await test("opencode_list names the workers and how long a wait may be", async () => {
   const list = (await listed.call("opencode_list")).text;
   assert.match(list, /^Workers:\nflash \(OpenCode agent deepseek-flash/m);
-  assert.match(list, /This server: client "claude-code", one opencode_result call waits up to 1500 s\.$/);
+  assert.match(list, /This server: client "claude-code" 0, protocol 2025-06-18, MCP tasks not offered; one opencode_result call waits up to 1500 s\.$/);
 });
 listed.stop();
 
+await test("without OPENCODE_TASKS the newer protocol is unknown, so a client falls back to initialize", async () => {
+  const off = new Server("state-tasks-off");
+  const r = await off.rpc("server/discover", { _meta: { "io.modelcontextprotocol/protocolVersion": "2026-07-28", "io.modelcontextprotocol/clientCapabilities": {} } });
+  assert.equal(r.error.code, -32601);
+  off.stop();
+});
+
+await test("with OPENCODE_TASKS a job is an MCP task: the run returns at once and tasks/get carries the reply", async () => {
+  const t = new Server("state-tasks", { OPENCODE_TASKS: "1" });
+  const meta = (caps = { extensions: { "io.modelcontextprotocol/tasks": {} } }, version = "2026-07-28") => ({
+    _meta: { "io.modelcontextprotocol/protocolVersion": version, "io.modelcontextprotocol/clientInfo": { name: "modern", version: "1" }, "io.modelcontextprotocol/clientCapabilities": caps },
+  });
+  const d = (await t.rpc("server/discover", meta())).result;
+  assert.equal(d.resultType, "complete");
+  assert.deepEqual(d.supportedVersions, ["2026-07-28"]);
+  assert.deepEqual(d.capabilities.extensions, { "io.modelcontextprotocol/tasks": {} });
+  assert.match(d.instructions, /background task/);
+  assert.equal((await t.rpc("server/discover", meta({}, "2030-01-01"))).error.code, -32022);
+  const tools = (await t.rpc("tools/list", meta())).result;
+  assert.equal(tools.resultType, "complete");
+  assert.match(tools.tools[0].description, /^Hands a task to a worker .* as a background task: .* Do not call `opencode_result` to wait for it\. Models: /);
+  assert.ok(tools.tools[0].description.length < 2048, String(tools.tools[0].description.length));
+  assert.doesNotMatch((await t.rpc("tools/list", meta({}))).result.tools[0].description, /as a background task/);
+
+  const made = (await t.rpc("tools/call", { name: "opencode_run", arguments: { prompt: "FAKE:hang:1500" }, ...meta() })).result;
+  assert.equal(made.resultType, "task");
+  assert.equal(made.status, "working");
+  assert.match(made.taskId, /^job_[a-z0-9]+_\d+$/);
+  assert.ok(made.ttlMs > 3600000 && made.pollIntervalMs === 5000 && made.createdAt && made.lastUpdatedAt);
+  const now = (await t.rpc("tasks/get", { taskId: made.taskId, ...meta() })).result;
+  assert.equal(now.resultType, "complete");
+  assert.equal(now.status, "working");
+  assert.equal(now.result, undefined);
+  let done;
+  await until("the task completes", async () => {
+    done = (await t.rpc("tasks/get", { taskId: made.taskId, ...meta() })).result;
+    return done.status === "completed";
+  });
+  assert.equal(done.result.isError, false);
+  assert.match(done.result.content[0].text, /^woke up\n\n---\nsession: /);
+  assert.equal((await t.rpc("tasks/get", { taskId: "job_nope_1", ...meta() })).error.code, -32602);
+
+  // a client without the extension gets the plain reply, with resultType
+  const plain = (await t.rpc("tools/call", { name: "opencode_run", arguments: { prompt: "FAKE:quick" }, ...meta({}) })).result;
+  assert.equal(plain.resultType, "complete");
+  assert.match(plain.content[0].text, /^started job_/);
+
+  // a task that is cancelled ends with what it left, as its result
+  const long = (await t.rpc("tools/call", { name: "opencode_run", arguments: { prompt: "FAKE:hang:60000" }, ...meta() })).result;
+  assert.deepEqual((await t.rpc("tasks/cancel", { taskId: long.taskId, ...meta() })).result, { resultType: "complete" });
+  const gone = (await t.rpc("tasks/get", { taskId: long.taskId, ...meta() })).result;
+  assert.equal(gone.status, "completed");
+  assert.equal(gone.result.isError, true);
+  assert.match(gone.result.content[0].text, /^status: cancelled/);
+
+  // the older protocol still works on the same server
+  assert.equal((await t.start()).serverInfo.version, "3.1.0");
+  t.stop();
+});
+
 await test("the wait is 50 s unless set, and a worker entry is read strictly", () => {
+  assert.equal(bridge.serviceDropped(['{"type":"unknown","message":"Transport: ECONNRESET: The socket connection was closed unexpectedly."}']), true);
+  assert.equal(bridge.serviceDropped(['{"name":"APIError","message":"Insufficient balance"}', ""]), false);
   assert.equal(bridge.waitLimit({ env: NaN }), 50, "under the 60 s after which the desktop app drops a call and closes the server");
   assert.equal(bridge.waitLimit({ env: 600 }), 600, "OPENCODE_WAIT_SECONDS decides");
   assert.equal(bridge.readWorker("x", { runs: "opencode" }), null, "an OpenCode worker needs an agent");

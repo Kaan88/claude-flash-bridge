@@ -80,6 +80,32 @@ While it waits it sends a progress message every 20 seconds to a client that ask
 gave up on (the user interrupted it, or its own limit ran out) is not answered, so a reply is never counted as
 delivered without having been read; the next call returns it.
 
+### Jobs as background tasks (no waiting at all)
+
+With `OPENCODE_TASKS=1` in the server's registration (`claude mcp add opencode -e OPENCODE_TASKS=1 -- node …`) the
+server also speaks MCP protocol 2026-07-28 with the tasks extension. Claude Code asks for that protocol first and
+falls back to the older one when a server does not know it, so without the switch nothing changes.
+
+With it, `opencode_run` returns at once as a task. Claude Code looks at the task by itself and hands the session the
+job's reply when the job has ended, also when the session was idle. No call is held open and the model spends no
+request on waiting. A job that timed out, failed or was cancelled arrives the same way, as its usual summary.
+`opencode_result` stays for a look at a running job.
+
+Tried in the Claude Code CLI 2.1.332 (interactive). Claude Code's documentation says tasks need an interactive
+session, and in the desktop app version 2.1.331 or later; `claude -p` gets the plain reply. `opencode_list` says
+what the client of that server offered ("MCP tasks offered"), and `clients.jsonl` in the state folder keeps it.
+
+### When OpenCode's service drops a job
+
+`opencode run` is a client of OpenCode's background service. When that service restarts under a running job (a
+second OpenCode of another version taking it over, or a CLI that found it slow), the client ends with
+`Transport: ECONNRESET`. The session is intact, so the bridge waits five seconds and carries on in the same
+session, up to twice per job, and the reply says so. Keep the `opencode` on the PATH at the version of the OpenCode
+desktop app if both are installed: two versions take the service from each other.
+
+The bridge asks the service directly (its address is in OpenCode's `service.json`) which sessions are busy, what
+tool is running and to interrupt one, and falls back to `opencode api` when it cannot.
+
 ## Claude Code workers
 
 A worker with `runs: "claude"` runs Claude Code's own CLI (`claude -p`) through the same jobs: `opencode_result`,
@@ -169,6 +195,8 @@ Each session runs its own copy of the server. After changing `server.mjs`: in a 
 | `BRIDGE_WORKERS_FILE` | `~/.config/opencode-bridge/workers.json` | the worker list |
 | `CLAUDE_WORKERS_FILE` | `~/.claude/claude-workers.json` | the older Claude workers file, read only while the worker list does not exist |
 | `OPENCODE_WAIT_SECONDS` | 50 | how long one `opencode_result` call may wait; raise it only for a client that keeps a long call open |
+| `OPENCODE_TASKS` | off | `1`: jobs run as MCP background tasks where the client offers them (see "Jobs as background tasks") |
+| `OPENCODE_RESUMES` | 2 | how often a job whose connection OpenCode's service dropped is carried on in its session; 0 switches it off |
 | `OPENCODE_ALLOW_ANY` | off | `1`: no worker list; any OpenCode agent or model can be asked for with `agent` and `model`, as before 3.0 |
 
 ## Tests

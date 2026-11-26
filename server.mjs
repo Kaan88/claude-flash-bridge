@@ -155,6 +155,13 @@ function pruneFiles(now = Date.now()) {
   if (!(KEEP_DAYS > 0)) return 0;
   let n = 0;
   try {
+    // the record of what each client offered: only the recent ones matter
+    const seen = join(STATE_DIR, "clients.jsonl");
+    if (existsSync(seen) && statSync(seen).size > 256 * 1024) unlinkSync(seen);
+  } catch {
+    // next time
+  }
+  try {
     for (const f of readdirSync(STATE_DIR)) {
       if (!/^job_[a-z0-9]+_\d+\.(json|jsonl|cancel)$/.test(f)) continue;
       const p = join(STATE_DIR, f);
@@ -415,7 +422,44 @@ function offReason(ref) {
 const CATALOG_FILE = join(STATE_DIR, `catalog-${createHash("sha1").update(process.cwd().toLowerCase()).digest("hex").slice(0, 10)}.json`);
 const LOCAL_HOST = /^(localhost|127\.|10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.|\[?::1\]?$|[^.]+$|.*\.local$)/i;
 
-function ocApi(op, params = [], timeout = 20000) {
+// OpenCode's background service, asked directly where its address is known. `opencode api` starts a CLI for every
+// question, and a CLI that gets no answer within a few seconds restarts the service, which cuts every job running
+// on this machine. A direct question that gets no answer only fails.
+const SERVICE_FILE = process.env.OPENCODE_SERVICE_FILE || join(process.env.XDG_STATE_HOME || join(homedir(), ".local", "state"), "opencode", "service.json");
+const SERVICE_OPS = {
+  "session.active": () => ["GET", "/api/session/active"],
+  "session.interrupt": (p) => ["POST", `/api/session/${encodeURIComponent(p.sessionID)}/interrupt`],
+  "session.message.list": ({ sessionID, ...q }) => ["GET", `/api/session/${encodeURIComponent(sessionID)}/message?${new URLSearchParams(q)}`],
+};
+// The answer, or null when the service can't be asked this way (then the CLI is). Throws when it does not answer.
+async function ocService(op, params, timeout) {
+  const route = SERVICE_OPS[op];
+  if (!route) return null;
+  let svc;
+  try {
+    svc = JSON.parse(readFileSync(SERVICE_FILE, "utf8"));
+  } catch {
+    return null;
+  }
+  if (!svc?.url || !svc.password) return null;
+  const [method, path] = route(Object.fromEntries(params.map((p) => p.split(/=(.*)/s).slice(0, 2))));
+  const res = await fetch(svc.url + path, {
+    method,
+    headers: { authorization: `Basic ${Buffer.from(`opencode:${svc.password}`).toString("base64")}` },
+    signal: AbortSignal.timeout(timeout),
+  });
+  if ([401, 403, 404, 405].includes(res.status)) return null;
+  if (!res.ok) throw new Error(`OpenCode's service answered ${res.status}`);
+  const j = await res.json();
+  return { data: j && typeof j === "object" && "data" in j ? j.data : j };
+}
+
+async function ocApi(op, params = [], timeout = 20000) {
+  const direct = await ocService(op, params, timeout);
+  return direct ? direct.data : ocCli(op, params, timeout);
+}
+
+function ocCli(op, params = [], timeout = 20000) {
   return new Promise((resolve, reject) => {
     const args = ["api", op, ...params.flatMap((p) => ["--param", p])];
     execFile(OPENCODE_EXE, args, { windowsHide: true, timeout, maxBuffer: 64 * 1024 * 1024 }, (err, out) => {
@@ -833,7 +877,7 @@ const buildOpenTool = () => ({
   name: "opencode_run",
   description:
     workersText() +
-    "Starts a task on another model and returns AT ONCE with a job id. Not a Claude Code background task: no notification comes when it ends; wait for the answer (and its session id) by calling `opencode_result` until it is done.To run several, start them all, then pass every id to `opencode_result` as `jobs`. " +
+    "Starts a task on another model and returns AT ONCE with a job id. Not a Claude Code background task: no notification comes when it ends; wait for the answer (and its session id) by calling `opencode_result` until it is done. To run several, start them all, then pass every id to `opencode_result` as `jobs`. " +
     "Models: OpenCode's (default DeepSeek Flash; any other via `model`, listed in its description), or Claude Code itself via `model` claude-code/fable, opus, sonnet or haiku (" +
     "your Claude plan, Claude Code's tools and CLAUDE.md, no MCP servers). " +
     "A new session starts with NO context: put everything it needs in `prompt` (paths, goal, constraints, output format). Pass `session` to continue an earlier one instead. " +
@@ -1150,6 +1194,30 @@ async function activeSessions() {
 }
 const sessionBusy = async (session) => (await activeSessions())?.includes(session) ?? null;
 
+// The session's newest assistant messages. OpenCode 2.3 names the operation `session.message.list`; older ones
+// `session.messages`. The name that answered is kept, so the other is not asked again.
+let messagesOp = "session.message.list";
+async function sessionMessages(session) {
+  const ask = (op) => ocApi(op, [`sessionID=${session}`, "limit=3", "order=desc", "type=assistant"], 8000);
+  try {
+    return await ask(messagesOp);
+  } catch (e) {
+    if (!/not found|unknown operation/i.test(String(e?.message))) throw e;
+    messagesOp = messagesOp === "session.messages" ? "session.message.list" : "session.messages";
+    return ask(messagesOp);
+  }
+}
+
+// OpenCode's service went away under a job (it restarted, or another OpenCode version took it over): the `run`
+// client reports a transport error and exits. The session and what it did are intact, so the job can go on in it.
+export const serviceDropped = (errors) => errors.some((e) => /Transport: |ECONNRESET|ECONNREFUSED|socket connection was closed|Background service/i.test(e));
+const RESUMES = Math.max(0, Number(process.env.OPENCODE_RESUMES ?? 2));
+const RESUME_WAIT_MS = Math.max(0, Number(process.env.OPENCODE_RESUME_WAIT_MS ?? 5000));
+const RESUME_PROMPT =
+  "The connection to OpenCode's service was lost while you were working on this task, and it is back now. " +
+  "A command that was running at that moment did not finish: check what it left behind before relying on it. " +
+  "Then carry on with the task from where you stopped, and reply as the task asked.";
+
 // Asks the service to interrupt the session's run (`session.interrupt`), then looks whether it went idle.
 async function stopSession(session) {
   let interrupted = null;
@@ -1281,6 +1349,7 @@ function runAgent(job, { prompt, directory, files = [], allow_edits = false, age
     }
     let exe = OPENCODE_EXE;
     let args;
+    let ocArgs;
     if (claude) {
       exe = CLAUDE_EXE;
       // headless, JSON events, no MCP servers (so a worker never starts this bridge again);
@@ -1297,23 +1366,28 @@ function runAgent(job, { prompt, directory, files = [], allow_edits = false, age
         return resolve(finish(job, "failed", `opencode executable not found: ${OPENCODE_EXE} (set OPENCODE_EXE)`));
       }
       const chosen = pickAgent({ agent, allow_edits });
-      args = ["run", "--format", "json", "--archived", "--agent", chosen];
-      if (session) args.push("--session", session);
-      else args.push("--title", "claude-delegate");
       // effort alone applies to the agent's own model, not always to OPENCODE_MODEL
       const ref = model || (effort ? resolveModel({ agent, allow_edits }) : "");
-      if (ref) args.push("--model", effort ? `${ref}#${effort}` : ref);
-      if (allow_edits) args.push("--auto");
-      for (const f of files) args.push("--file", f);
+      ocArgs = (ses, attach) => {
+        const a = ["run", "--format", "json", "--archived", "--agent", chosen];
+        if (ses) a.push("--session", ses);
+        else a.push("--title", "claude-delegate");
+        if (ref) a.push("--model", effort ? `${ref}#${effort}` : ref);
+        if (allow_edits) a.push("--auto");
+        for (const f of attach) a.push("--file", f);
+        return a;
+      };
+      args = ocArgs(session, files);
     }
+    const stdinFor = (text) => (allow_edits ? text : `READ-ONLY TASK: do not create, modify or delete any files and do not run state-changing commands.\n\n${text}`);
     const take = claude ? absorbClaude : absorb;
 
     const acc = { texts: [], errors: [], cost: 0, reasoning: 0, stderr: "", tools: 0, peakIdle: 0, stepOpen: false, flights: new Map() };
     const log = createWriteStream(s.log);
     let child;
-    try {
-      const cwd = directory && existsSync(directory) ? directory : process.cwd();
-      child = spawn(exe, args, {
+    const cwd = directory && existsSync(directory) ? directory : process.cwd();
+    const start = (withArgs) =>
+      spawn(exe, withArgs, {
         cwd,
         // OpenCode takes its working folder from PWD when set, and an inherited PWD is this server's folder
         env: claude ? claudeEnv(cwd) : { ...process.env, PWD: cwd },
@@ -1321,6 +1395,8 @@ function runAgent(job, { prompt, directory, files = [], allow_edits = false, age
         windowsHide: true,
         detached: process.platform !== "win32",
       });
+    try {
+      child = start(args);
     } catch (e) {
       log.end();
       return resolve(finish(job, "failed", `spawn failed: ${e.message}`));
@@ -1374,7 +1450,7 @@ function runAgent(job, { prompt, directory, files = [], allow_edits = false, age
     const askFlight = () => {
       const asked = s.lastEvent;
       probe.busy = true;
-      ocApi("session.messages", [`sessionID=${s.session}`, "limit=3", "order=desc", "type=assistant"], 8000)
+      sessionMessages(s.session)
         .then(
           (data) => findRunningTool(data),
           () => ({ unknown: true, label: "a tool call (OpenCode could not say which)", since: asked }),
@@ -1416,6 +1492,37 @@ function runAgent(job, { prompt, directory, files = [], allow_edits = false, age
       if (verdict.expired && !(probe.busy && probe.answered !== s.lastEvent)) end("timeout", idleReason({ limitMs: verdict.limitMs, flight, now }));
     }, 1000);
 
+    // After the service dropped the job's connection: wait for it to be back, make sure the old run is not still
+    // going there, then go on in the same session. The wall-clock limit keeps counting from the first start.
+    const resume = async () => {
+      s.resumed = (s.resumed || 0) + 1;
+      s.note = `OpenCode's service dropped this job's connection ${s.resumed === 1 ? "once" : `${s.resumed} times`}; it went on in the same session each time`;
+      log.write(`${JSON.stringify({ type: "bridge", note: "connection to the service lost; resuming the session", errors: acc.errors.slice(-2) })}\n`);
+      acc.errors.length = 0;
+      acc.texts.length = 0;
+      acc.flights.clear();
+      acc.stepOpen = false;
+      acc.final = undefined;
+      mark();
+      saveState(s);
+      await sleep(RESUME_WAIT_MS);
+      if (ended) return;
+      if ((await sessionBusy(s.session)) === true) await stopSession(s.session);
+      if (ended) return;
+      mark();
+      try {
+        child = start(ocArgs(s.session, []));
+      } catch (e) {
+        acc.errors.push(`spawn failed: ${e.message}`);
+        return end("failed", "could not start opencode again after its service dropped the connection");
+      }
+      job.child = child;
+      s.childPid = child.pid;
+      saveState(s);
+      wire(child, stdinFor(RESUME_PROMPT));
+    };
+
+    const wire = (child, text) => {
     let pending = "";
     child.stdout.on("data", (d) => {
       log.write(d);
@@ -1452,6 +1559,8 @@ function runAgent(job, { prompt, directory, files = [], allow_edits = false, age
       }
       const text = clean(acc.final ?? acc.texts.join("\n\n"));
       const ok = code === 0 && !!text && !acc.errors.length;
+      const left = s.timeoutMs - (Date.now() - s.running);
+      if (!ok && !claude && s.session && (s.resumed || 0) < RESUMES && left > RESUME_WAIT_MS + 30000 && serviceDropped([...acc.errors, acc.stderr])) return void resume();
       if (!ok) return end("failed", code === 0 ? (text ? "the agent reported errors" : "empty reply") : `opencode exited ${code}`);
       ended = true;
       clearTimeout(wallTimer);
@@ -1461,13 +1570,14 @@ function runAgent(job, { prompt, directory, files = [], allow_edits = false, age
       const footer =
         "\n\n---\n" +
         (s.session ? `session: ${s.session} (pass as \`session\` to continue this conversation) · cost $${acc.cost.toFixed(4)}${claude ? "" : ` · reasoning ${acc.reasoning} tok`}\n` : "") +
-        `stats: ${stats(job, acc)}`;
+        `stats: ${stats(job, acc)}` +
+        (s.resumed ? `\nnote: ${s.note}` : "");
       // the cap keeps the footer: cut the body, then append it
       resolve(finish(job, "done", cap(text, MAX_REPLY - footer.length, s.log) + footer, true));
     });
-    child.stdin.end(
-      allow_edits ? prompt : `READ-ONLY TASK: do not create, modify or delete any files and do not run state-changing commands.\n\n${prompt}`,
-    );
+    child.stdin.end(text);
+    };
+    wire(child, stdinFor(prompt));
   });
 }
 
@@ -1624,7 +1734,7 @@ async function listText() {
     "",
     ...who,
     "",
-    `This server: client "${clientName || "unknown"}", one opencode_result call waits up to ${waitLimit()} s.`,
+    `This server: client "${clientName || "unknown"}"${client.version ? ` ${client.version}` : ""}, protocol ${client.protocol || "?"}, MCP tasks ${client.tasks ? "offered" : "not offered"}; one opencode_result call waits up to ${waitLimit()} s.`,
   ].join("\n");
 }
 
@@ -1698,8 +1808,102 @@ const SERVER_INSTRUCTIONS =
 
 const send = (msg) => process.stdout.write(JSON.stringify(msg) + "\n");
 
+// What this client offers, kept for opencode_list and in clients.jsonl: whether a client can take a long job as an
+// MCP task (the io.modelcontextprotocol/tasks extension) is known only from what it sends.
+const TASKS_EXT = "io.modelcontextprotocol/tasks";
+const VERSION = "3.1.0";
+
+// ---- MCP tasks (OPENCODE_TASKS=1) ----
+// With protocol 2026-07-28 and the tasks extension a client takes a long job as a task: opencode_run returns at
+// once, the client asks tasks/get now and then by itself, and hands the model the job's reply when it has ended.
+// No call is held open and the model spends no request on waiting. Claude Code asks for that protocol first
+// (server/discover) and falls back to initialize when the server does not know it, so this is behind a switch:
+// off, nothing changes. The protocol has no handshake: every request says what the client can do.
+const TASKS_ON = process.env.OPENCODE_TASKS === "1";
+const MODERN = "2026-07-28";
+const PV = "io.modelcontextprotocol/protocolVersion";
+const TASK_POLL_MS = Math.max(250, Number(process.env.OPENCODE_TASK_POLL_MS || 5000));
+const offersTasks = (params) => !!params?._meta?.["io.modelcontextprotocol/clientCapabilities"]?.extensions?.[TASKS_EXT];
+const TASK_INSTRUCTIONS =
+  "`opencode_run` hands a task to one of the user's workers (listed in its `worker` parameter; nothing else can be run). " +
+  "It runs as a background task: the call returns at once and the job's reply is delivered to you when the job ends. " +
+  "Start every job you need, then carry on with other work or end the turn. Do not wait for a job in any way: no `opencode_result` loop, " +
+  "sleep, Monitor, ScheduleWakeup or subagent. `opencode_result` with `wait_seconds: 0` only looks at what a job is doing.";
+// The run tool's opening, which says how to wait, reworded for a client that takes the job as a task.
+const taskDescription = (d) =>
+  d.replace(/^.*? as `jobs`. /s, () => "Hands a task to a worker (another model working on its own) as a background task: the call returns at once, and the job's reply, with its session id, is delivered to you when the job ends. Do not call `opencode_result` to wait for it. ");
+const iso = (ms) => new Date(ms || Date.now()).toISOString();
+// A job as the extension's task. Whatever way it ended, its reply is the tool result ("failed" is for protocol errors).
+function taskOf(s) {
+  const done = !isPending(s);
+  const t = { taskId: s.id, status: done ? "completed" : "working", createdAt: iso(s.started), lastUpdatedAt: iso(done ? s.finished : s.lastEvent || s.started), ttlMs: s.timeoutMs + 60 * MIN, pollIntervalMs: TASK_POLL_MS };
+  if (done) t.result = { content: [{ type: "text", text: s.reply || `${s.id} ${s.status}` }], isError: !s.ok };
+  else t.statusMessage = progressShort(s).slice(0, 300);
+  return t;
+}
+const client = { protocol: "", version: "", methods: [], tasks: false };
+function noteClient(method, params) {
+  let changed = false;
+  if (method && !client.methods.includes(method) && client.methods.length < 30) {
+    client.methods.push(method);
+    changed = /^(initialize|server\/|tasks\/)/.test(method);
+  }
+  const meta = params?._meta || {};
+  const caps = [params?.capabilities, meta["io.modelcontextprotocol/clientCapabilities"]];
+  const protocol = String(params?.protocolVersion || meta["io.modelcontextprotocol/protocolVersion"] || "");
+  if (protocol && protocol !== client.protocol) {
+    client.protocol = protocol;
+    changed = true;
+  }
+  if (!client.tasks && caps.some((c) => c?.extensions?.[TASKS_EXT] || c?.tasks)) {
+    client.tasks = true;
+    changed = true;
+  }
+  if (params?.clientInfo) {
+    client.version = String(params.clientInfo.version || "");
+    client.capabilities = params.capabilities;
+  }
+  if (!changed) return;
+  try {
+    const line = { at: new Date().toISOString(), pid: process.pid, name: params?.clientInfo?.name || clientName, ...client };
+    writeFileSync(join(STATE_DIR, "clients.jsonl"), `${JSON.stringify(line)}\n`, { flag: "a" });
+  } catch {
+    // a record only
+  }
+}
+
 async function handle(msg) {
   const { id, method, params } = msg;
+  noteClient(method, params);
+  // a request of the newer protocol says so itself; its results carry resultType
+  const modern = TASKS_ON && params?._meta?.[PV] !== undefined;
+  const out = (m) => send(modern && m.result && !m.result.resultType ? { ...m, result: { resultType: "complete", ...m.result } } : m);
+  if (modern) {
+    if (params._meta[PV] !== MODERN)
+      return send({ jsonrpc: "2.0", id, error: { code: -32022, message: "Unsupported protocol version", data: { supported: [MODERN], requested: params._meta[PV] } } });
+    clientName = String(params._meta["io.modelcontextprotocol/clientInfo"]?.name || clientName);
+    if (method === "server/discover")
+      return out({
+        jsonrpc: "2.0",
+        id,
+        result: {
+          supportedVersions: [MODERN],
+          capabilities: { tools: {}, extensions: { [TASKS_EXT]: {} } },
+          _meta: { "io.modelcontextprotocol/serverInfo": { name: "opencode-agent", version: VERSION } },
+          instructions: offersTasks(params) ? TASK_INSTRUCTIONS : SERVER_INSTRUCTIONS,
+        },
+      });
+    if (method === "tasks/get" || method === "tasks/cancel") {
+      const f = current(String(params?.taskId ?? ""));
+      if (!f) return send({ jsonrpc: "2.0", id, error: { code: -32602, message: `unknown task ${params?.taskId}` } });
+      if (method === "tasks/cancel") {
+        if (isPending(f.state)) await cancelJob(f.state.id);
+        return out({ jsonrpc: "2.0", id, result: {} });
+      }
+      if (!isPending(f.state)) delivered.add(f.state.id);
+      return out({ jsonrpc: "2.0", id, result: taskOf(f.state) });
+    }
+  }
   if (method === "initialize") {
     clientName = String(params?.clientInfo?.name || "");
     return send({
@@ -1708,7 +1912,7 @@ async function handle(msg) {
       result: {
         protocolVersion: params?.protocolVersion || "2025-06-18",
         capabilities: { tools: { listChanged: true } },
-        serverInfo: { name: "opencode-agent", version: "3.0.1" },
+        serverInfo: { name: "opencode-agent", version: VERSION },
         instructions: SERVER_INSTRUCTIONS,
       },
     });
@@ -1726,10 +1930,11 @@ async function handle(msg) {
   if (method === "tools/list") {
     // first run in this folder: wait (bounded) for the live list; otherwise the cache answers at once
     if (!catalog && refreshing) await Promise.race([refreshing, new Promise((r) => setTimeout(r, 10000))]);
-    return send({ jsonrpc: "2.0", id, result: { tools: [buildTool(), resultTool(), CANCEL_TOOL, LIST_TOOL] } });
+    const run = buildTool();
+    return out({ jsonrpc: "2.0", id, result: { tools: [modern && offersTasks(params) ? { ...run, description: taskDescription(run.description) } : run, resultTool(), CANCEL_TOOL, LIST_TOOL] } });
   }
   if (method === "tools/call") {
-    const reply = (text, isError = false) => send({ jsonrpc: "2.0", id, result: { content: [{ type: "text", text }], isError } });
+    const reply = (text, isError = false) => out({ jsonrpc: "2.0", id, result: { content: [{ type: "text", text }], isError } });
     const a = params?.arguments || {};
     if (params?.name === "opencode_run") {
       if (!a.prompt) return reply("prompt is required", true);
@@ -1744,6 +1949,8 @@ async function handle(msg) {
       const s = jobs.get(job).state;
       const model = `${a.model || resolveModel(a)}${a.effort ? `#${a.effort}` : ""}`;
       const on = a._w ? ` on worker ${a._w.name} (${model})` : a.model || a.effort ? ` on ${model}` : "";
+      if (modern && offersTasks(params))
+        return out({ jsonrpc: "2.0", id, result: { resultType: "task", ...taskOf(s), statusMessage: `started ${job}${on}${waiting}; its reply is delivered when it ends` } });
       return reply(`started ${job}${on}${waiting}, limit ${s.timeoutMs / 1000}s, idle ${s.idleMs / 1000}s. Wait for it with one call: opencode_result { job: "${job}" } (or several ids at once as \`jobs\`); it returns when the job ends.`);
     }
     if (params?.name === "opencode_result") {
@@ -1803,7 +2010,7 @@ async function handle(msg) {
     if (params?.name === LIST_TOOL.name) return reply(await listText());
     return send({ jsonrpc: "2.0", id, error: { code: -32602, message: `unknown tool ${params?.name}` } });
   }
-  if (method === "ping") return send({ jsonrpc: "2.0", id, result: {} });
+  if (method === "ping") return out({ jsonrpc: "2.0", id, result: {} });
   if (id !== undefined) send({ jsonrpc: "2.0", id, error: { code: -32601, message: `method not found: ${method}` } });
 }
 
