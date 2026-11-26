@@ -94,7 +94,10 @@ async function main() {
       const url = new URL(req.url, "http://localhost"), path = url.pathname;
       const send = o => res.end(JSON.stringify(o));
       try {
-        if (path === "/api/info") return send({pid:process.pid});
+        if (path === "/api/info") {
+          if (existsSync(join(dir,"slow-probe"))) await sleep(1900);
+          return send({pid:process.pid});
+        }
         if (path === "/api/plugin") return send({data:[{id:"fake"}]});
         if (path === "/api/integration") return send({data:rows()});
         if (path === "/api/agent") return operation("agent.list", {}, send);
@@ -108,7 +111,10 @@ async function main() {
         if (path === "/test/stop") {
           rmSync(regFile, {force:true}); send({}); setImmediate(() => process.exit(0)); return;
         }
-        if (path === "/api/session/active") return operation("session.active", {}, send);
+        if (path === "/api/session/active") {
+          if (existsSync(join(dir,"active-unavailable"))) return res.writeHead(503).end();
+          return operation("session.active", {}, send);
+        }
         const history = `${db}.sessions`;
         if (path === "/api/session") {
           const all = existsSync(history) ? readJson(history) : [];
@@ -130,6 +136,7 @@ async function main() {
     await new Promise(() => {});
   }
   if (cmd === "service" && rest[0] === "stop") {
+    if (existsSync(join(dir,"stop-unavailable"))) process.exit(1);
     const s = readJson(regFile);
     await fetch(s.url+"/test/stop",{headers:{authorization:`Basic ${Buffer.from("opencode:"+s.password).toString("base64")}`}});
     return;

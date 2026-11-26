@@ -3,11 +3,15 @@
 import { execFile, spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
-import { createServer } from "node:net";
+import { createConnection, createServer } from "node:net";
+import { request } from "node:http";
+import { once } from "node:events";
 import { homedir } from "node:os";
 import { basename, delimiter, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { promisify } from "node:util";
 import { setTimeout as delay } from "node:timers/promises";
+import { fileURLToPath } from "node:url";
+import { birth, independentNode, legacyWorker, matches, ownsPort } from "./process-identity.mjs";
 
 export function findOpencode() {
   if (process.env.OPENCODE_EXE) return process.env.OPENCODE_EXE;
@@ -42,10 +46,6 @@ const atomic = (file, value) => {
   const tmp = `${file}.${randomUUID()}.tmp`;
   writeFileSync(tmp, JSON.stringify(value) + "\n", { mode: 0o600 });
   renameSync(tmp, file);
-};
-const live = pid => {
-  if (!(Number.isInteger(pid) && pid > 0)) return false;
-  try { process.kill(pid, 0); return true; } catch (e) { return e.code === "EPERM"; }
 };
 const magic = "@cortexkit/opencode-magic-context";
 export function withoutMagic(config) {
@@ -158,102 +158,244 @@ export function environment(svc, cwd, loadKeys=!svc) {
 }
 export const targetArgs = svc => svc ? ["--server", svc.url] : ["--standalone"];
 export async function api(svc, path, { method = "GET", body, timeout = 8000 } = {}) {
-  if (!svc || !/^http:\/\/127\.0\.0\.1:\d+$/.test(svc.url) || !svc.password) throw Error("Worker service is unavailable.");
-  const res = await fetch(svc.url + path, { method, redirect: "error", signal: AbortSignal.timeout(timeout),
-    headers: { authorization: `Basic ${Buffer.from(`opencode:${svc.password}`).toString("base64")}`, "content-type": "application/json" },
-    ...(body ? { body: JSON.stringify(body) } : {}) });
-  if (!res.ok) throw Error(`Worker OpenCode API returned HTTP ${res.status}.`); // response bodies can hold secrets
-  return res.status === 204 ? null : res.json();
+  if (!svc?.password || !/^http:\/\/127\.0\.0\.1:\d+$/.test(svc.url) || !await matches(svc))
+    throw Error("Worker service listener could not be verified.");
+  const port=Number(new URL(svc.url).port), signal=AbortSignal.timeout(timeout);
+  const socket=createConnection({host:"127.0.0.1",port,signal});
+  socket.on("error",()=>{}); // may close while the OS ownership check is in flight
+  try {
+    await once(socket,"connect");
+    // Authenticate on this exact connection. Checking a listener then opening
+    // a second socket would let a port rebound race inherit its Basic header.
+    if (!await ownsPort(svc.pid,port,socket.localPort) || !await matches(svc) || socket.destroyed)
+      throw Error("Worker service listener could not be verified.");
+    const res=await new Promise((ok,fail)=>{
+      const req=request(svc.url+path,{method,signal,createConnection:()=>socket,headers:{
+        authorization:`Basic ${Buffer.from(`opencode:${svc.password}`).toString("base64")}`,
+        "content-type":"application/json",connection:"close",
+      }},ok);
+      req.on("error",fail); req.end(body ? JSON.stringify(body) : undefined);
+    });
+    if (res.statusCode<200 || res.statusCode>=300) throw Error(`Worker OpenCode API returned HTTP ${res.statusCode}.`);
+    if (res.statusCode===204) return null;
+    const chunks=[];
+    for await (const chunk of res) chunks.push(chunk);
+    try { return JSON.parse(Buffer.concat(chunks).toString()); } catch { throw Error("Worker OpenCode API returned an invalid response."); }
+  } finally { socket.destroy(); }
 }
-// A kernel-held cross-process lock: no stale lock to steal on crash. A Windows named pipe,
-// or a loopback listener on Unix. It accepts no commands and is never a service address.
-const lockID = createHash("sha256").update(canonical(root).toLowerCase()).digest("hex");
-const lockAddress = process.platform === "win32" ? { path: `\\\\.\\pipe\\opencode-bridge-${lockID}` }
-  : { host: "127.0.0.1", port: 18000 + parseInt(lockID.slice(0, 4), 16) % 10000 };
 async function listener(address) {
   const server = createServer(socket => socket.destroy());
   await new Promise((ok, fail) => server.once("error", fail).listen({ ...address, exclusive: true }, ok));
   return server;
 }
 async function locked(action) {
-  let lock;
-  for (const until = Date.now() + 30000; !lock;) {
-    try { lock = await listener(lockAddress); }
-    catch (e) { if (e.code !== "EADDRINUSE" || Date.now() >= until) throw Error("Worker service coordinator lock unavailable."); await delay(60); }
-  }
-  try { return await action(); } finally { await new Promise(ok => lock.close(ok)); }
+  // Lamport's bakery: per-acquisition, never-reused filenames avoid stealing
+  // a successor's lock. Publish choosing (0), then (ticket, unique name).
+  const dir = join(root,"admission"), id = randomUUID(), file = join(dir,id);
+  mkdirSync(dir,{recursive:true,mode:0o700});
+  const self = {pid:process.pid,birth:await selfBirth(), ticket:0};
+  const peers = async () => {
+    const out = [];
+    for (const name of readdirSync(dir)) {
+      if (name === id || name.endsWith(".tmp")) continue;
+      const path = join(dir,name), rec = optional(path);
+      if (!rec) continue;
+      if (!await matches(rec)) { rmSync(path,{force:true}); continue; }
+      out.push({name,...rec});
+    }
+    return out;
+  };
+  atomic(file,self);
+  try {
+    self.ticket = 1+Math.max(0,...(await peers()).map(x=>x.ticket));
+    atomic(file,self);
+    // Later contenders necessarily choose a higher ticket.
+    for (const until=Date.now()+120000;;) {
+      if (!(await peers()).some(x=>!x.ticket || x.ticket<self.ticket || x.ticket===self.ticket && x.name<id)) break;
+      if (Date.now()>until) throw Error("Worker profile is blocked by another coordinator.");
+      await delay(60);
+    }
+    return await action();
+  } finally { rmSync(file,{force:true}); }
 }
-async function healthy(svc) {
-  try { return (await api(svc, "/api/info", { timeout: 1500 })).pid === svc.pid; } catch { return false; }
+let ownBirth;
+const selfBirth = () => ownBirth ||= birth(process.pid);
+async function healthy(svc, timeout=1500) {
+  try { return (await api(svc, "/api/info", { timeout })).pid === svc.pid; } catch { return false; }
 }
 function publish(svc) {
   const value = { version: 1, env: paths, registration, sourceConfig: src, workers: workerFile, address: svc?.url || null };
-  if (JSON.stringify(optional(contract)) !== JSON.stringify(value)) atomic(contract, value);
+  let last;
+  try { last=optional(contract); } catch { /* repair derived public state */ }
+  if (JSON.stringify(last) !== JSON.stringify(value)) atomic(contract, value);
 }
-async function start(gen) {
-  // Reuse the same port across crashes: even if a bridge dies between spawn and recording the
-  // PID, a successor cannot start another listening service while the first is registering.
-  const child = spawn(exe, ["serve", "--service", "--hostname", "127.0.0.1", "--port", String(gen.port)],
-    { env: environment(null, root), cwd: root, stdio: "ignore", windowsHide: true, detached: true });
-  let failed = false;
-  child.once("error", () => { failed = true; }); child.unref();
-  gen.pid = child.pid || null; atomic(manifest, gen);
-  for (const until = Date.now() + 12000; !failed && child.exitCode === null && Date.now() < until;) {
-    const svc = optional(registration);
-    if (svc?.pid === child.pid && await healthy(svc)) return svc;
-    await delay(100);
+function registered() {
+  try { return optional(registration); } catch { return null; } // OpenCode writes in place
+}
+function endpoint(gen) {
+  const r = registered();
+  return r?.pid === gen?.pid && r?.url === `http://127.0.0.1:${gen.port}` ? {...r,birth:gen.birth} : null;
+}
+async function readers(svc) {
+  const clients = [], held=new Set(), stale=[];
+  for (const f of readdirSync(leases)) {
+    if (f.endsWith(".tmp")) continue;
+    const file = join(leases,f);
+    let rec;
+    try { rec = optional(file); } catch { /* legacy empty lease */ }
+    if (await matches(rec) || (f.endsWith("-private") && await matches(rec?.child))) {
+      clients.push(f); if (rec.session) held.add(rec.session); continue;
+    }
+    stale.push({file,rec});
   }
-  if (child.pid && child.exitCode === null) child.kill();
-  return null;
+  for (const {file,rec} of stale) {
+    if ((rec?.session || rec?.title) && !held.has(rec.session)) {
+      if (!svc) continue; // replacement services may recover unfinished sessions from jobs.db
+      const active = (await api(svc,"/api/session/active")).data;
+      let session=rec.session;
+      // The bridge may die before `run` emits its first event. A unique
+      // pre-recorded title identifies that run without touching other jobs.
+      if (!session) for (const id of Object.keys(active)) {
+        if (!held.has(id) && (await api(svc,`/api/session/${encodeURIComponent(id)}`)).data?.title===rec.title) { session=id; break; }
+      }
+      if (session && Object.hasOwn(active,session)) {
+        await interrupt(svc,session);
+        if (Object.hasOwn((await api(svc,"/api/session/active")).data,session))
+          throw Error("Worker service is blocked by a previous session still stopping.");
+      } else if (await matches(rec.child)) continue;
+    }
+    rmSync(file,{force:true});
+  }
+  return clients;
 }
-function readers() {
-  return readdirSync(leases).filter(f => {
-    if (live(Number(f.split("-")[0]))) return true;
-    rmSync(join(leases, f), { force: true }); return false;
+export const interrupt = (svc,id) => api(svc,`/api/session/${encodeURIComponent(id)}/interrupt`,{method:"POST"});
+async function stopIdle(svc) {
+  if (Object.keys((await api(svc,"/api/session/active")).data).length) return false;
+  await promisify(execFile)(exe,["service","stop"],{cwd:root,env:environment(null,root,false),timeout:12000,windowsHide:true});
+  for (const end=Date.now()+3000; await matches(svc) && Date.now()<end;) await delay(80);
+  return !await matches(svc);
+}
+// An independent supervisor owns the actual child handle and idle clock even
+// after every bridge exits. Admission fences delayed/superseded launch requests.
+async function supervise(token) {
+  let child, gen;
+  await locked(async()=>{
+    gen=optional(manifest);
+    if (gen?.launch!==token) return;
+    // If the supervisor itself is hard-killed between spawn and recording
+    // the child's creation time, no successor can know jobs.db is free.
+    gen.spawning=true; atomic(manifest,gen);
+    child=spawn(exe,["serve","--service","--hostname","127.0.0.1","--port",String(gen.port)],
+      {cwd:root,env:environment(null,root),stdio:"ignore",windowsHide:true});
+    child.on("error",()=>{});
+    gen.pid=child.pid || null; gen.birth=await birth(gen.pid);
+    gen.launch=null; delete gen.spawning; atomic(manifest,gen);
   });
+  if (!child?.pid || !gen.birth) return;
+  const idleMs=Number(process.env.BRIDGE_SERVICE_IDLE_MS)||600000;
+  let idleSince=Date.now();
+  const stopped=new AbortController();
+  child.once("exit",()=>stopped.abort());
+  while (child.exitCode===null && child.signalCode===null) {
+    try { await delay(Math.min(30000,idleMs),undefined,{signal:stopped.signal}); }
+    catch (e) { if (stopped.signal.aborted) return; throw e; }
+    try { await locked(async()=>{
+      if (!await matches(gen)) return;
+      const svc=endpoint(gen);
+      if (!svc || (await readers(svc)).length || Object.keys((await api(svc,"/api/session/active")).data).length) idleSince=null;
+      else {
+        idleSince ??= Date.now();
+        if (Date.now()-Math.max(idleSince,statSync(leases).mtimeMs)>=idleMs && await stopIdle(svc)) publish(null);
+      }
+    }); } catch { idleSince=null; }
+  }
 }
+if (process.argv[1] && resolve(process.argv[1])===fileURLToPath(import.meta.url) && process.argv[2]==="supervise")
+  await supervise(process.argv[3]);
+
 export async function acquire() {
-  return locked(async () => {
+  let attempted=false, waited=0;
+  const deadline=Date.now()+60000;
+  const admit=async () => {
     for (const source of [src, join(homedir(), ".config", "opencode")].map(canonical)) {
       const dest = canonical(dst);
       if (inside(source, dest) || inside(dest, source) || inside(source, canonical(root)))
         throw Error("The worker profile and personal config directories must be separate.");
     }
     mkdirSync(leases, { recursive: true, mode: 0o700 });
-    const clients = readers();
-    let gen = optional(manifest), reg = optional(registration);
-    let svc = reg && gen?.pid === reg.pid && live(reg.pid) && await healthy(reg) ? reg : null;
-    const snap = !gen || !clients.length ? snapshot() : null;
-    if (svc && snap && gen.hash !== snap.hash) {
-      const active = (await api(svc, "/api/session/active")).data;
-      if (active && !Object.keys(active).length) {
-        // Authenticated PID + private registration + our recorded child. Never stop a process
-        // merely because a stale PID is alive, or because its health probe timed out.
-        await promisify(execFile)(exe, ["service", "stop"], { cwd: root, env: environment(null, root), timeout: 12000, windowsHide: true });
-        for (const end = Date.now() + 2000; live(svc.pid) && Date.now() < end;) await delay(50);
-        svc = null;
-      }
+    let gen=optional(manifest), svc=null, note="";
+    if (gen?.spawning) throw Error("Worker launch was interrupted before ownership was recorded. Verify the worker service is stopped before resetting its generation.");
+    if (gen?.launch) {
+      if (Date.now()-gen.requested<30000) return null;
+      gen.launch=null; atomic(manifest,gen); attempted=true;
     }
-    const blocked = live(gen?.pid) || live(reg?.pid);
-    if (!svc && !blocked && !clients.some(f => f.endsWith("-private"))) {
+    if (await matches(gen)) {
+      svc=endpoint(gen);
+      if (!svc || !await healthy(svc,waited ? 6000 : 1500)) {
+        waited++;
+        if (Date.now()<deadline) return null;
+        throw Error("Worker service is alive but not responding; jobs.db is reserved. Retry when it is ready.");
+      }
+    } else {
+      // An active pre-upgrade listener cannot be adopted on PID alone.
+      const r=registered();
+      if (!gen?.birth && r?.url===`http://127.0.0.1:${gen?.port}` && await legacyWorker(r.pid,gen.port))
+        throw Error("A worker listener without matching creation time still owns the profile port. Close it before retrying.");
+      if (gen?.pid) {gen.pid=null; gen.birth=null; atomic(manifest,gen);}
+    }
+    const clients=await readers(svc);
+    let snap;
+    try { if (!gen || !clients.length) snap=snapshot(); }
+    catch (e) { if (!gen) throw e; note="Worker config could not be refreshed; using its last installed copy."; }
+    if (svc && snap && gen.hash !== snap.hash) {
+      try { if (await stopIdle(svc)) svc=null; else note="Worker config refresh deferred while the service is busy."; }
+      catch { note="Worker service did not confirm an idle stop; config refresh deferred."; if (!await healthy(svc)) return null; }
+    }
+    if (!svc) {
       if (snap && (!gen || gen.hash !== snap.hash)) {
-        const port = gen?.port || await (async () => { const sock = await listener({host:"127.0.0.1",port:0}); const n = sock.address().port; await new Promise(ok => sock.close(ok)); return n; })();
         install(snap, gen);
-        gen = { hash: snap.hash, files: [...snap.files.keys()], port, pid: null };
+        gen = { hash: snap.hash, files: [...snap.files.keys()], pid: null };
         atomic(manifest, gen);
       }
-      svc = await start(gen);
+      if (clients.some(f=>f.endsWith("-private"))) note="A standalone worker holds jobs.db; waiting for it to finish.";
+      else if (!attempted) {
+        attempted=true;
+        const sock=await listener({host:"127.0.0.1",port:0}); gen.port=sock.address().port; await new Promise(ok=>sock.close(ok));
+        gen.launch=randomUUID(); gen.requested=Date.now(); atomic(manifest,gen);
+        const env={...process.env}; delete env.OPENCODE_PASSWORD; delete env.OPENCODE_SERVER_PASSWORD;
+        try { await independentNode(fileURLToPath(import.meta.url),["supervise",gen.launch],root,env); return null; }
+        catch { gen.launch=null; atomic(manifest,gen); }
+      }
+      if (!note) note="Worker service failed to start; using standalone for this job.";
+      // Do not extend a chain of overlapping private leases indefinitely.
+      if (clients.some(f=>f.endsWith("-private"))) {
+        if (++waited<100) return null;
+        throw Error(note);
+      }
     }
     if (!gen) throw Error("Cannot establish ownership of the worker service profile.");
     publish(svc);
     const file = join(leases, `${process.pid}-${randomUUID()}-${svc ? "service" : "private"}`);
-    writeFileSync(file, "", { flag: "wx" });
-    return { svc, release: () => rmSync(file, { force: true }) };
-  });
+    const rec={pid:process.pid,birth:await selfBirth()};
+    atomic(file,rec);
+    let abandoned=false, released=false;
+    return {svc,note, track(session) { if (svc && session!==rec.session) { rec.session=session; atomic(file,rec); } },
+      starting(title,session) { if (svc) { Object.assign(rec,{title,session}); atomic(file,rec); } },
+      async bindClient(pid) {
+        const stamp=await birth(pid); if (!released && !abandoned && stamp) { rec.child={pid,birth:stamp}; atomic(file,rec); }
+      },
+      abandon() { abandoned=true; atomic(file,{...rec,pid:null}); },
+      release() { released=true; if (!abandoned) rmSync(file,{force:true}); }};
+  };
+  for (;;) {
+    const result=await locked(admit);
+    if (result) return result;
+    await delay(200);
+  }
 }
 export async function using(fn) {
   const lease = await acquire();
-  try { return await fn(lease.svc); } finally { lease.release(); }
+  try { return await fn(lease.svc,lease); } finally { lease.release(); }
 }
 // Use the integration list, NOT credential.list/auth export (those can return secret values).
 export async function integrations(svc, cwd) {
@@ -308,7 +450,7 @@ export function configModel(agent) {
 export async function pruneArchived(days) {
   if (!Number.isInteger(days) || days < 1) throw Error("Specify a positive number of days.");
   return using(svc => locked(async () => {
-    if (!svc || readers().length !== 1 || Object.keys((await api(svc, "/api/session/active")).data).length)
+    if (!svc || (await readers(svc)).length !== 1 || Object.keys((await api(svc, "/api/session/active")).data).length)
       throw Error("Prune needs an idle worker service.");
     const rows = (await api(svc, "/api/session?archived=true&order=asc&limit=100")).data;
     const cutoff = Date.now() - days * 86400000;

@@ -13,7 +13,7 @@ async function main() {
       (["login", "logout", "key"].includes(action) ? !valid.test(provider || "") : provider !== undefined))
     throw Error("Usage: node bridge-auth.mjs list | login PROVIDER | logout PROVIDER | prune DAYS");
   const cwd = dirname(paths.OPENCODE_DB);
-  await using(async svc => {
+  await using(async (svc,lease) => {
     if (action === "status") {
       const rows = await integrations(svc, cwd);
       const available = await availableProviders(svc,cwd);
@@ -54,8 +54,10 @@ async function main() {
       return;
     }
     const child = spawn(findOpencode(), ["auth", action, ...(provider ? [provider] : []), ...targetArgs(svc)],
-      { cwd, env: environment(svc, cwd), stdio: "inherit" });
-    process.exitCode = await new Promise((ok, fail) => child.once("error", fail).once("exit", code => ok(code ?? 1)));
+      { cwd, env: environment(svc, cwd), stdio: "inherit",timeout:600000 });
+    const exited = new Promise((ok, fail) => child.once("error", fail).once("exit", code => ok(code ?? 1)));
+    if (!svc) await lease.bindClient(child.pid);
+    process.exitCode = await exited;
   });
 }
 try { await main(); } catch {

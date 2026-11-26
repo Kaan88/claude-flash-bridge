@@ -83,11 +83,14 @@ plugin. An agent's opt-out line alone would leave the plugin's tools and summari
 `"magicContextInJobs": true` in `workers.json` to use your **personal service and sign-ins** instead.
 
 The first catalog request, job or worker sign-in starts the service on loopback. Every job pins its `opencode run`
-client to that endpoint; cancelling the client also interrupts the session there. Bridges check the authenticated
-service PID and coordinate starts and config updates under a cross-process lock. An update waits for an idle
+client to that endpoint. Killing the client alone does **not** interrupt its session: the bridge sends an
+explicit interrupt and records the session on its lease for crash recovery. Bridges check the process creation
+time and OS listener owner **before** authenticating and coordinate starts and config updates under a cross-process lock. An update waits for an idle
 service: even a client preparing to start or signing in holds a place. If the service can't start, jobs fall back
 to `run --standalone` with the **worker** config, credentials and DB. Live session inspection is unavailable in
-that fallback. Closing a Claude session does not stop the shared service.
+that fallback. A live but unresponsive service reserves the database; jobs wait or report the blocker instead of
+opening it standalone. Closing a Claude session does not stop the shared service. An independent supervisor
+retires it after ten minutes without leases or active sessions.
 
 **Cost:** on the owner's Windows machine 3.3.0 used ~350–370 MB working set per private server **plus** ~125 MB per
 client (~2.4 GB for five jobs). Normal 3.4.0 usage is **one worker server plus ~125 MB per concurrent job**.
@@ -97,7 +100,7 @@ bridge no longer needs to wake it in worker mode.
 
 ### Signing in for workers
 
-Open **OpenCode Config Studio › Workers › Worker sign-ins**. Choose **Enter API key** for DeepSeek, or **Sign in**
+Open **OpenCode Config Studio › Workers › Worker sign-ins** and click **Check sign-ins**. Choose **Enter API key** for DeepSeek, or **Sign in**
 for OpenAI and finish OpenCode's browser flow. Click **Check sign-ins** afterwards. This list reflects saved
 workers; Claude Code workers use their existing Claude accounts. Missing worker credentials are reported before
 the model is called. In a terminal, from the bridge installation directory:
@@ -134,11 +137,16 @@ overrides its parent. Contract **version 1** has these fields:
 | `address` | Last observed healthy worker URL, or `null`. It is a hint, not proof of liveness. |
 | `sourceConfig`, `workers` | Paths to the **editable** personal config directory and the bridge workers file. |
 
-The contract contains no credentials. Use the helper to start the service or manage sign-ins. For a status display,
-match the registration URL to the loopback address, authenticate `GET /api/info`, and match the returned PID to
-the registration. Use `/api/session/active` there for live worker sessions; the personal service has its own list.
+The contract contains no credentials. Use `bridge-auth.mjs status` on request to check sign-ins.
+Never send the password based on the contract or registration alone. Use the coordinator for API access: it
+checks the recorded creation time and OS listener owner before `GET /api/info`. Use `/api/session/active` there
+for live worker sessions; the personal service has its own list.
 Show the two services by name and version. Don't use personal `service restart` for workers, edit the generated
 copy, or run automatic service discovery with the worker environment: the bridge owns worker startup and rotation.
+
+When upgrading from 3.4.0, drain existing jobs and close old bridge clients first. A still-running
+3.4.0 worker has no recorded creation time. If the bridge reports that old listener, stop the **worker**
+with its contract environment after it drains; the next request starts a supervised instance.
 
 **Upgrading a running 3.3 installation:** let current jobs finish and hold new submissions. Before changing the
 live bridge, quit any older Config Studio instance and launch the new Studio build with `STUDIO_WORKER_AUTH_HELPER`

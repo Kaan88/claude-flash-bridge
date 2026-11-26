@@ -81,13 +81,18 @@ try:
         active = api("/api/session/active")["data"]
         print("active after killed CLI:",len(active),flush=True)
         assert active
+        if bridge:
+            holder.stdin.close(); holder.wait(timeout=10)
+            time.sleep(4.5) # over two idle checks, with no lease
+            assert api("/api/session/active")["data"].keys()==active.keys()
         for session in active: api("/api/session/"+session+"/interrupt",True)
     finally:
         if client.poll() is None: client.kill()
 finally:
     release.set()
     if bridge:
-        holder.stdin.close(); holder.wait(timeout=10)
+        if not holder.stdin.closed: holder.stdin.close()
+        holder.wait(timeout=10)
         for _ in range(150):
             if not reg.exists(): break
             time.sleep(.1)
