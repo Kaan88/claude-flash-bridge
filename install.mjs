@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // Sets up the deepseek-flash bridge on this PC: OpenCode agents, Claude Code (user scope), Claude Desktop.
 // Run from this folder after copying it to ~/.claude/mcp-servers/opencode-agent:  node install.mjs
-import { execSync } from "node:child_process";
+import { execFileSync, execSync } from "node:child_process";
 import { copyFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { delimiter, dirname, join } from "node:path";
@@ -163,16 +163,27 @@ editJson(settings, (c) => {
   c.env.MCP_TOOL_TIMEOUT ??= "1800000";
 });
 
-// 4. Smoke test through OpenCode
+// 4. Sign-in and smoke test in the same profile that actually runs workers.
 try {
   if (!opencode) throw new Error("OpenCode executable not found");
-  const out = execSync(`"${opencode}" run --agent deepseek-flash --archived "Reply with exactly: PONG"`, {
-    encoding: "utf8",
-    timeout: 120000,
-    cwd: homedir(),
-  });
-  out.includes("PONG") ? ok("OpenCode + DeepSeek reply: PONG") : warn(`unexpected reply: ${out.trim().slice(0, 200)}`);
-} catch (e) {
-  warn(`OpenCode smoke test failed (is the deepseek provider signed in? run: opencode auth): ${e.message.split("\n")[0]}`);
+  process.env.OPENCODE_EXE = opencode;
+  const profile = await import("./job-service.mjs");
+  const personal = existsSync(profile.workerFile) && JSON.parse(readFileSync(profile.workerFile, "utf8")).magicContextInJobs === true;
+  const smoke = async svc => {
+    const target = personal ? [] : profile.targetArgs(svc);
+    const cwd = personal ? homedir() : dirname(profile.paths.OPENCODE_DB);
+    const opts = { env: personal ? process.env : profile.environment(svc, cwd), cwd };
+    const signed = () => JSON.parse(execFileSync(opencode, ["auth","list","--format","json",...target], { ...opts, timeout:20000, encoding:"utf8" }))
+      .some(row => row.id === "deepseek" && row.connections?.some(c => personal || c.type === "credential"));
+    if (!signed() && process.argv.includes("--signin"))
+      execFileSync(opencode, ["auth","login","deepseek",...target], { ...opts, stdio:"inherit" });
+    if (!signed()) return warn(personal ? "Sign in with opencode auth login deepseek." : "Sign in for DeepSeek in Config Studio › Workers, or run node bridge-auth.mjs login deepseek.");
+    const out = execFileSync(opencode, ["run","--agent","deepseek-flash","--archived",...target,"Reply with exactly: PONG"],
+      { ...opts, input:"", encoding:"utf8", timeout:120000 });
+    out.includes("PONG") ? ok("OpenCode + DeepSeek reply: PONG") : warn("OpenCode did not reply PONG.");
+  };
+  if (personal) await smoke(null); else await profile.using(smoke);
+} catch {
+  warn("OpenCode smoke test failed. Check the worker's DeepSeek sign-in.");
 }
 console.log("\nDone. Fully quit Claude Desktop (tray icon too) and reopen; start a new Claude Code session.");

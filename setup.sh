@@ -97,16 +97,7 @@ else
   rm -rf "$tmp"
 fi
 
-# 5. DeepSeek key: only asked for when OpenCode has none
-if opencode auth list 2>&1 | grep -Eiq '\bdeepseek\b.*\bstored\b'; then
-  say "DeepSeek key already stored in OpenCode"
-else
-  say "OpenCode has no DeepSeek key yet. Pick DeepSeek and paste your API key at OpenCode's prompt (https://platform.deepseek.com/api_keys)."
-  opencode auth login deepseek <"$TTY" || true
-  opencode auth list 2>&1 | grep -Eiq '\bdeepseek\b.*\bstored\b' || warn "No DeepSeek key stored; run 'opencode auth login deepseek' later, then run this again."
-fi
-
-# 6. Agents, Claude Code and Claude Desktop registration, smoke test
+# 5. Registration, sign-in and smoke test against the worker's actual profile.
 say "Registering the bridge"
 [ -f "$DIR/install.mjs" ] || { echo "$DIR has no install.mjs (an old copy?); register it by hand or delete the folder and run this again." >&2; exit 1; }
-cd "$DIR" && node install.mjs
+cd "$DIR" && node install.mjs --signin <"$TTY"

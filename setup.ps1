@@ -125,19 +125,8 @@ if (Test-Path (Join-Path $Dir "server.mjs")) {
     Remove-Item -Recurse -Force $tmp, $zip
 }
 
-# 6. DeepSeek key: only asked for when OpenCode has none
-$auth = (opencode auth list 2>&1) -join "`n"
-if ($auth -notmatch '(?im)^\s*\S.*\bdeepseek\b.*\bstored\b') {
-    Say "OpenCode has no DeepSeek key yet. Pick DeepSeek and paste your API key at OpenCode's prompt (https://platform.deepseek.com/api_keys)."
-    opencode auth login deepseek
-    $auth = (opencode auth list 2>&1) -join "`n"
-    if ($auth -notmatch '(?im)\bdeepseek\b.*\bstored\b') { Warn "No DeepSeek key stored; run 'opencode auth login deepseek' later, then run this again." }
-} else {
-    Say "DeepSeek key already stored in OpenCode"
-}
-
-# 7. Agents, Claude Code and Claude Desktop registration, smoke test
+# 6. Registration, sign-in and smoke test against the worker's actual profile.
 Say "Registering the bridge"
 if (-not (Test-Path (Join-Path $Dir "install.mjs"))) { throw "$Dir has no install.mjs (an old copy?); register it by hand or delete the folder and run this again." }
 Push-Location $Dir
-try { node install.mjs } finally { Pop-Location }
+try { node install.mjs --signin } finally { Pop-Location }

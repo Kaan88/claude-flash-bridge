@@ -1,6 +1,6 @@
 # OpenCode bridge for Claude Code
 
-A small MCP server (no dependencies, one file) that lets Claude hand work to **workers**: other models working on
+A small MCP server (Node, no dependencies) that lets Claude hand work to **workers**: other models working on
 their own. A worker runs either an agent in [OpenCode](https://opencode.ai) (DeepSeek Flash by default, on DeepSeek's
 API, which doesn't count against your Claude usage limits) or Claude Code itself in the background (which does).
 Claude plans and reviews; the workers do the hands-on work.
@@ -76,20 +76,77 @@ account it is signed in to. The bridge reads only `oauthAccount.accountUuid` fro
 
 ### Magic Context in jobs
 
-If OpenCode's config lists the Magic Context plugin (`@cortexkit/opencode-magic-context`), an OpenCode job does not
-get it: the bridge runs the job on a private server (`opencode run --standalone`) whose config folder
-(`OPENCODE_CONFIG_DIR`) is a copy of yours, made again before each job, with the plugin left out and OpenCode's own
-compaction on. It covers every worker and agent. The plugin's opt-out line in an agent's instructions is not enough:
-it only drops the plugin's prompt text, while `ctx_reduce`, its summaries and its compaction still run. Sign-ins,
-sessions and the database are outside the config folder, so they stay shared; the copy leaves out `service.json`.
-Your own OpenCode sessions keep the plugin. `"magicContextInJobs": true` in `workers.json` keeps it in jobs too.
-The copy lives in `~/.config/opencode-bridge/opencode-jobs` (`BRIDGE_JOB_CONFIG_DIR`). An `opencode.jsonc` config
-is not rewritten: jobs then use the service as before.
+Plain `opencode` keeps your usual settings, sign-ins and Magic Context. Since **3.4.0**, all bridge processes share
+one separate worker service. Its config is a copy of your global OpenCode config (JSON or JSONC); the copy omits
+your `service.json`, removes `@cortexkit/opencode-magic-context` and enables native compaction when it removes the
+plugin. An agent's opt-out line alone would leave the plugin's tools and summaries running. Set
+`"magicContextInJobs": true` in `workers.json` to use your **personal service and sign-ins** instead.
 
-Not measured yet: each running job is now its own OpenCode server, so memory grows per job (before, a job was a
-small client of the one shared service) and a job takes a few seconds longer to start. If that turns out to cost too
-much, the alternative (owner, 2026-11-26) is a second, permanent OpenCode service for jobs only, started with the
-plugin-free config: one fixed cost instead of one per job, but one more background service to keep running.
+The first catalog request, job or worker sign-in starts the service on loopback. Every job pins its `opencode run`
+client to that endpoint; cancelling the client also interrupts the session there. Bridges check the authenticated
+service PID and coordinate starts and config updates under a cross-process lock. An update waits for an idle
+service: even a client preparing to start or signing in holds a place. If the service can't start, jobs fall back
+to `run --standalone` with the **worker** config, credentials and DB. Live session inspection is unavailable in
+that fallback. Closing a Claude session does not stop the shared service.
+
+**Cost:** on the owner's Windows machine 3.3.0 used ~350–370 MB working set per private server **plus** ~125 MB per
+client (~2.4 GB for five jobs). Normal 3.4.0 usage is **one worker server plus ~125 MB per concurrent job**.
+An idle scratch worker service measured 411 MiB after provider discovery; its footprint depends on loaded
+projects and models. Your personal service is separate; the
+bridge no longer needs to wake it in worker mode.
+
+### Signing in for workers
+
+Open **OpenCode Config Studio › Workers › Worker sign-ins**. Choose **Enter API key** for DeepSeek, or **Sign in**
+for OpenAI and finish OpenCode's browser flow. Click **Check sign-ins** afterwards. This list reflects saved
+workers; Claude Code workers use their existing Claude accounts. Missing worker credentials are reported before
+the model is called. In a terminal, from the bridge installation directory:
+
+```sh
+node bridge-auth.mjs list
+node bridge-auth.mjs login deepseek
+node bridge-auth.mjs login openai
+node bridge-auth.mjs logout openai
+```
+
+These run OpenCode's own `auth` commands. Type keys only in the prompt or Studio's password field. OpenCode v2.4.1
+stores saved credentials in its SQLite database alongside sessions. A separate database is essential: a managed
+service tries to recover unfinished work from its entire DB at startup. Worker history and stored credentials
+therefore belong only to workers. No personal credential rows are copied. Changing modes does not migrate old
+`ses_…` IDs; start a fresh session when switching databases.
+
+**Disk usage:** a fresh v2.4.1 worker DB measured ~13.4 MiB, plus ~13.5 MiB of SQLite WAL just after bootstrap.
+`--archived` hides sessions; it doesn't delete their messages, tool output or usage history. Growth depends on
+the work, not simply the number of jobs. If needed, run `node bridge-auth.mjs prune 30` while workers are idle.
+It examines up to the oldest 100 archived sessions, removing only childless sessions archived **and** last updated
+more than 30 days ago. Removed sessions can't be continued. SQLite can reuse freed pages; the file need not shrink.
+This is separate from `OPENCODE_KEEP_DAYS`, which cleans bridge logs.
+
+### Worker service contract (Studio, Claude Switch and other clients)
+
+The bridge atomically publishes `~/.config/opencode-bridge/job-service.json` on first use. `BRIDGE_JOB_HOME`
+overrides its parent. Contract **version 1** has these fields:
+
+| Field | Meaning |
+|---|---|
+| `env` | Absolute `OPENCODE_CONFIG_DIR`, `XDG_STATE_HOME`, `XDG_DATA_HOME`, `OPENCODE_DB` paths. Defaults are `job-service/{config,state,data,jobs.db}` under the bridge folder. `BRIDGE_JOB_CONFIG_DIR` overrides the generated config location. |
+| `registration` | `<XDG_STATE_HOME>/opencode/service.json`, written by OpenCode. Contains private endpoint authentication; never display it. |
+| `address` | Last observed healthy worker URL, or `null`. It is a hint, not proof of liveness. |
+| `sourceConfig`, `workers` | Paths to the **editable** personal config directory and the bridge workers file. |
+
+The contract contains no credentials. Use the helper to start the service or manage sign-ins. For a status display,
+match the registration URL to the loopback address, authenticate `GET /api/info`, and match the returned PID to
+the registration. Use `/api/session/active` there for live worker sessions; the personal service has its own list.
+Show the two services by name and version. Don't use personal `service restart` for workers, edit the generated
+copy, or run automatic service discovery with the worker environment: the bridge owns worker startup and rotation.
+
+**Upgrading a running 3.3 installation:** let current jobs finish and hold new submissions. Before changing the
+live bridge, quit any older Config Studio instance and launch the new Studio build with `STUDIO_WORKER_AUTH_HELPER`
+set to the absolute path of the staged `bridge-auth.mjs`. Use the usual bridge folder (not a temporary profile).
+Sign in to DeepSeek and OpenAI on **Workers** and check both statuses. Then deploy the whole bridge release
+(including `job-service.mjs` and `bridge-auth.mjs`), reconnect the MCP bridge in each Claude session, and try one
+short job per provider. The staged sign-ins stay in the worker DB. Launch Studio normally after the upgrade.
+No personal OpenCode service restart is needed.
 
 For an OpenCode worker the bridge reads the agent's model and its effort levels from OpenCode
 (`opencode api model.list` / `agent.list`, cached per project folder), so `effort` is checked per model and a wrong
@@ -136,8 +193,8 @@ second OpenCode of another version taking it over, or a CLI that found it slow),
 session, up to twice per job, and the reply says so. Keep the `opencode` on the PATH at the version of the OpenCode
 desktop app if both are installed: two versions take the service from each other.
 
-The bridge asks the service directly (its address is in OpenCode's `service.json`) which sessions are busy, what
-tool is running and to interrupt one, and falls back to `opencode api` when it cannot.
+The bridge asks the selected service directly which sessions are busy, what tool is running and to interrupt one.
+In personal-service mode it retains the older `opencode api` fallback.
 
 ## Claude Code workers
 
@@ -173,7 +230,7 @@ The same command installs and updates. It:
    wherever it lives, otherwise `~/.claude/mcp-servers/opencode-agent`. A git clone gets a fast-forward
    `git pull` (skipped with a warning if it has local changes or there's no network); any other copy is used as
    it is. Only when there is no bridge is this repo installed there;
-3. asks for a DeepSeek API key only when OpenCode has none: it runs `opencode auth login deepseek`, so the key
+3. asks for a DeepSeek API key only when the selected worker profile has none: it runs `opencode auth login deepseek` in that profile, so the key
    goes straight into OpenCode's own store and never through the script, a file or the command line;
 4. runs `node install.mjs` (below).
 
@@ -182,10 +239,9 @@ to also upgrade OpenCode to its latest release.
 
 ## Install by hand
 
-Needs Node 18+, OpenCode, and Claude Code and/or Claude Desktop.
+Needs Node 18+, OpenCode (worker service verified with v2.4.1), and Claude Code and/or Claude Desktop.
 
-1. Install OpenCode and sign in to the DeepSeek provider: `opencode auth login` (the API key stays in
-   OpenCode's own store, never in this repo).
+1. Install OpenCode.
 2. Clone this repo to `~/.claude/mcp-servers/opencode-agent`.
 3. Run `node install.mjs` in that folder. It:
    - adds the `deepseek-flash` agent (asks before edits and shell commands) to `~/.config/opencode/opencode.json` and removes the old `deepseek-flash-ro`,
@@ -194,7 +250,8 @@ Needs Node 18+, OpenCode, and Claude Code and/or Claude Desktop.
    - registers the server in Claude Code (user scope) without time-limit settings, so every client uses the server's own defaults (it sets `OPENCODE_EXE` only when OpenCode isn't on PATH),
    - adds it to Claude Desktop's `claude_desktop_config.json`,
    - sets `MCP_TOOL_TIMEOUT=1800000` in `~/.claude/settings.json` (a safety net),
-   - backs up every file it changes (`.bak-<time>`) and ends with a PONG test.
+   - backs up every registration/config file it changes (`.bak-<time>`) and checks for PONG if DeepSeek is signed in.
+   Sign in in Studio › Workers or run `node bridge-auth.mjs login deepseek` from the install folder.
 4. Restart Claude Code / the desktop app.
 
 ## Updating sessions that are already open

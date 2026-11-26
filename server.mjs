@@ -12,24 +12,15 @@
 // into the tool description; Claude is told (tools/list_changed) when a refresh changes them.
 import { execFile, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import { cpSync, createWriteStream, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, statSync, unlinkSync, utimesSync, watchFile, writeFileSync } from "node:fs";
+import { createWriteStream, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, statSync, unlinkSync, utimesSync, watchFile, writeFileSync } from "node:fs";
+import * as profile from "./job-service.mjs";
+import { fileURLToPath } from "node:url";
+export { withoutMagic } from "./job-service.mjs";
 import { createInterface } from "node:readline";
 import { homedir, tmpdir } from "node:os";
 import { delimiter, isAbsolute, join, resolve } from "node:path";
 
-// The npm shim (opencode.cmd / opencode.ps1) mangles stdin, so find the real binary next to it.
-function findOpencode() {
-  if (process.env.OPENCODE_EXE) return process.env.OPENCODE_EXE;
-  const exe = process.platform === "win32" ? "opencode.exe" : "opencode";
-  for (const dir of (process.env.PATH || "").split(delimiter)) {
-    if (!dir) continue;
-    const real = join(dir, "node_modules", "@opencode", "cli", "bin", exe);
-    if (existsSync(real)) return real;
-    if (existsSync(join(dir, exe))) return join(dir, exe);
-  }
-  return exe;
-}
-const OPENCODE_EXE = findOpencode();
+const OPENCODE_EXE = profile.findOpencode();
 
 // Claude Code's own CLI as a second kind of worker: model "claude-code/<alias>" runs `claude -p`.
 function findClaude() {
@@ -62,7 +53,7 @@ const DEFAULT_AGENT = process.env.OPENCODE_AGENT || "deepseek-flash";
 // so an install from before the list keeps working. OPENCODE_ALLOW_ANY=1 brings back the older behaviour, where
 // any OpenCode agent or model can be asked for with `agent` and `model`.
 const ALLOW_ANY = process.env.OPENCODE_ALLOW_ANY === "1";
-const WORKERS_FILE = process.env.BRIDGE_WORKERS_FILE || join(homedir(), ".config", "opencode-bridge", "workers.json");
+const WORKERS_FILE = profile.workerFile;
 const LEGACY_WORKERS_FILE = process.env.CLAUDE_WORKERS_FILE || join(homedir(), ".claude", "claude-workers.json");
 const CLAUDE_ALIASES = ["fable", "opus", "sonnet", "haiku"];
 const WORKER_NAME = /^[A-Za-z0-9][\w.-]*$/;
@@ -464,7 +455,7 @@ function offReason(ref) {
   if (blockedRefs().has(r.toLowerCase())) return "the blocklist";
   return "";
 }
-const CATALOG_FILE = join(STATE_DIR, `catalog-${createHash("sha1").update(process.cwd().toLowerCase()).digest("hex").slice(0, 10)}.json`);
+const catalogFile = (personal) => join(STATE_DIR, `catalog-${createHash("sha1").update(JSON.stringify([process.cwd().toLowerCase(), personal ? "personal" : profile.paths.OPENCODE_DB])).digest("hex").slice(0, 10)}.json`);
 const LOCAL_HOST = /^(localhost|127\.|10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.|\[?::1\]?$|[^.]+$|.*\.local$)/i;
 
 // OpenCode's background service, asked directly where its address is known. `opencode api` starts a CLI for every
@@ -499,15 +490,27 @@ async function ocService(op, params, timeout) {
   return { data: j && typeof j === "object" && "data" in j ? j.data : j };
 }
 
-async function ocApi(op, params = [], timeout = 20000) {
+async function ocApi(op, params = [], timeout = 20000, mode = workerSet().magic ? "owner" : "worker") {
+  if (mode === "standalone") throw Error("A private fallback run has no shared session API.");
+  if (mode === "worker") return profile.using(async svc => {
+    const route = SERVICE_OPS[op];
+    if (!svc && op.startsWith("session.")) throw Error("Worker session service is unavailable.");
+    if (svc && route) {
+      const [method, path] = route(Object.fromEntries(params.map(p => p.split(/=(.*)/s).slice(0, 2))));
+      const result = await profile.api(svc, path, { method, timeout });
+      return result.data ?? result;
+    }
+    return ocCli(op, params, timeout, svc);
+  });
   const direct = await ocService(op, params, timeout);
   return direct ? direct.data : ocCli(op, params, timeout);
 }
 
-function ocCli(op, params = [], timeout = 20000) {
+function ocCli(op, params = [], timeout = 20000, svc) {
   return new Promise((resolve, reject) => {
     const args = ["api", op, ...params.flatMap((p) => ["--param", p])];
-    execFile(OPENCODE_EXE, args, { windowsHide: true, timeout, maxBuffer: 64 * 1024 * 1024 }, (err, out) => {
+    if (svc !== undefined) args.push(...profile.targetArgs(svc));
+    execFile(OPENCODE_EXE, args, { env: svc !== undefined ? profile.environment(svc, process.cwd()) : process.env, windowsHide: true, timeout, maxBuffer: 64 * 1024 * 1024 }, (err, out) => {
       if (err) return reject(err);
       try {
         const j = JSON.parse(out);
@@ -529,8 +532,23 @@ function isLocal(m) {
   }
 }
 
+function guardedAgent(a) {
+  // Both edits and shell commands must need approval for a read-only job (last matching rule wins).
+  const last = (action) => (a.permissions || a.permission || []).filter((r) => (r.action === action || r.action === "*") && r.resource === "*").at(-1);
+  return [last("edit"), last("shell")].every((r) => r && r.effect !== "allow");
+}
+
 async function fetchCatalog() {
-  const [models, agents, def] = await Promise.all([ocApi("model.list"), ocApi("agent.list"), ocApi("model.default").catch(() => null)]);
+  const [models, agents, def] = workerSet().magic
+    ? await Promise.all([ocApi("model.list"), ocApi("agent.list"), ocApi("model.default").catch(() => null)])
+    : await profile.using(async svc => {
+      const endpoints = [["model.list","/api/model"],["agent.list","/api/agent"],["model.default","/api/model/default"]];
+      if (svc) await profile.warm(svc, process.cwd());
+      const ask = ([op, path]) => svc
+        ? profile.api(svc, `${path}?directory=${encodeURIComponent(process.cwd())}`, {timeout:20000}).then(r => r.data ?? r)
+        : ocCli(op, [`directory=${process.cwd()}`], 20000, null);
+      return Promise.all(endpoints.map((entry, i) => i === 2 ? ask(entry).catch(() => null) : ask(entry)));
+    });
   const all = new Map();
   for (const m of models) {
     if (m.enabled === false || (m.type && m.type !== "chat") || (m.status && !/^(active|beta)$/.test(m.status))) continue;
@@ -550,13 +568,6 @@ async function fetchCatalog() {
   );
   for (const [ref, b] of bases) all.get(ref).offline = !up.get(b);
   // what an agent runs on: its own model and variant, else OpenCode's default model
-  // can this agent change files when nothing approves its asks? (the last matching rule wins)
-  // Both edits and shell commands must need an approval: an agent that asks before edits but runs any shell
-  // command freely can still change files in a read-only job.
-  const guarded = (a) => {
-    const last = (action) => (a.permissions || a.permission || []).filter((r) => (r.action === action || r.action === "*") && r.resource === "*").at(-1);
-    return [last("edit"), last("shell")].every((r) => r && r.effect !== "allow");
-  };
   const agentModel = (a) => (a.model?.id ? `${a.model.providerID}/${a.model.id}${a.model.variant ? `#${a.model.variant}` : ""}` : def ? `${refOf(def)} (default)` : "default model");
   return {
     at: Date.now(),
@@ -564,14 +575,14 @@ async function fetchCatalog() {
     models: [...all.values()],
     // hidden agents too: a worker may run an agent that OpenCode's own picker does not show
     agents: agents
-      .map((a) => ({ name: a.id, hidden: !!a.hidden, mode: a.mode, guarded: guarded(a), model: agentModel(a), description: (a.description || "").split(/(?<=\.)\s/)[0].slice(0, 90) })),
+      .map((a) => ({ name: a.id, hidden: !!a.hidden, mode: a.mode, guarded: guardedAgent(a), model: agentModel(a), description: (a.description || "").split(/(?<=\.)\s/)[0].slice(0, 90) })),
     defaultModel: def ? refOf(def) : null,
   };
 }
 
 function readCachedCatalog() {
   try {
-    const c = JSON.parse(readFileSync(CATALOG_FILE, "utf8"));
+    const c = JSON.parse(readFileSync(catalogFile(workerSet().magic), "utf8"));
     return Array.isArray(c.models) && Array.isArray(c.agents) ? c : null;
   } catch {
     return null;
@@ -581,17 +592,28 @@ function readCachedCatalog() {
 let catalog = readCachedCatalog();
 let catalogError = "";
 let refreshing = null;
+let catalogMode;
+function demandCatalog() {
+  const mode = workerSet().magic;
+  if (catalogMode !== mode) {
+    if (catalogMode !== undefined) catalog = null;
+    catalogMode = mode;
+    refreshCatalog();
+  }
+}
 let clientReady = false;
 
 // Refreshes the catalog; when it changed after Claude already listed the tools, tells it to list them again.
 function refreshCatalog() {
+  const personal = workerSet().magic;
   refreshing ??= fetchCatalog()
     .then((fresh) => {
+      if (workerSet().magic !== personal) { catalogMode = undefined; return; }
       catalogError = "";
       const same = catalog && JSON.stringify({ ...catalog, at: 0 }) === JSON.stringify({ ...fresh, at: 0 });
       catalog = fresh;
       try {
-        writeFileSync(CATALOG_FILE, JSON.stringify(fresh));
+        writeFileSync(catalogFile(personal), JSON.stringify(fresh));
       } catch {
         // cache is best effort
       }
@@ -749,6 +771,7 @@ async function validate(args) {
     if (args.session && !CLAUDE_SESSION.test(args.session)) return "that session is an OpenCode one; continue it without a claude-code model";
     return "";
   }
+  demandCatalog();
   if (!catalog && refreshing) await Promise.race([refreshing, new Promise((r) => setTimeout(r, 10000))]);
   if (!catalog) return ""; // no catalog: let OpenCode judge
   const check = () => {
@@ -777,9 +800,15 @@ async function validate(args) {
     return "";
   };
   let err = check();
-  if (err && Date.now() - catalog.at > 10000) {
+  if (err && (Date.now() - catalog.at > 10000 || (!workerSet().magic && err.startsWith("unknown model")))) {
     await refreshCatalog();
     err = check();
+  }
+  if (err?.startsWith("unknown model") && !workerSet().magic) {
+    try {
+      const fix = await profile.using(svc => missingSignIn(svc, resolveModel(args), resolve(args.directory || ".")));
+      if (fix) return fix;
+    } catch { /* keep the original validation error */ }
   }
   return err;
 }
@@ -1229,22 +1258,22 @@ export function resumeNote({ claude, session, interrupted, busy }) {
 const ocSession = (s) => (s.session && !CLAUDE_SESSION.test(s.session) && !String(s.model || "").startsWith(`${CLAUDE_PROVIDER}/`) ? s.session : "");
 
 // The ids of the sessions the service is executing now (`session.active`), or null when it can't be asked.
-async function activeSessions() {
+async function activeSessions(mode) {
   try {
-    const act = await ocApi("session.active", [], 8000);
+    const act = await ocApi("session.active", [], 8000, mode);
     if (Array.isArray(act)) return act.map((x) => (typeof x === "string" ? x : x?.sessionID || x?.id)).filter(Boolean);
     return act && typeof act === "object" ? Object.keys(act) : null;
   } catch {
     return null;
   }
 }
-const sessionBusy = async (session) => (await activeSessions())?.includes(session) ?? null;
+const sessionBusy = async (session, mode) => (await activeSessions(mode))?.includes(session) ?? null;
 
 // The session's newest assistant messages. OpenCode 2.3 names the operation `session.message.list`; older ones
 // `session.messages`. The name that answered is kept, so the other is not asked again.
 let messagesOp = "session.message.list";
-async function sessionMessages(session) {
-  const ask = (op) => ocApi(op, [`sessionID=${session}`, "limit=3", "order=desc", "type=assistant"], 8000);
+async function sessionMessages(session, mode) {
+  const ask = (op) => ocApi(op, [`sessionID=${session}`, "limit=3", "order=desc", "type=assistant"], 8000, mode);
   try {
     return await ask(messagesOp);
   } catch (e) {
@@ -1264,85 +1293,30 @@ const RESUME_PROMPT =
   "A command that was running at that moment did not finish: check what it left behind before relying on it. " +
   "Then carry on with the task from where you stopped, and reply as the task asked.";
 
-// Magic Context in jobs. The plugin is loaded by the OpenCode server that runs a session, and an agent's opt-out line
-// only drops its prompt text (ctx_reduce, the historian and its compaction stay). So unless workers.json says
-// "magicContextInJobs": true, an OpenCode job runs on a private server (`--standalone`) whose config folder
-// (OPENCODE_CONFIG_DIR) is a copy of the user's, made again before each job, with the plugin left out and OpenCode's
-// own compaction on. Sign-ins, sessions and the database are not in the config folder, so they stay shared, and the
-// user's own OpenCode keeps the plugin. With no plugin listed, or a config that can't be read, jobs use the service.
-const OC_CONFIG_DIR = process.env.OPENCODE_CONFIG_DIR || join(homedir(), ".config", "opencode");
-const JOB_CONFIG_DIR = process.env.BRIDGE_JOB_CONFIG_DIR || join(homedir(), ".config", "opencode-bridge", "opencode-jobs");
-const MAGIC_PACKAGE = "@cortexkit/opencode-magic-context";
-const pluginName = (e) => String(typeof e === "string" ? e : Array.isArray(e) ? e[0] : e?.name || e?.package || "");
-const isMagicEntry = (e) => {
-  const n = pluginName(e);
-  return n === MAGIC_PACKAGE || n.startsWith(MAGIC_PACKAGE + "@");
-};
-// The config without the plugin and with OpenCode's own compaction on (as Studio's Context switch writes it), or
-// null when the plugin is not listed.
-export function withoutMagic(config) {
-  const keys = ["plugins", "plugin"].filter((k) => Array.isArray(config?.[k]) && config[k].some(isMagicEntry));
-  if (!keys.length) return null;
-  const lean = { ...config, compaction: { ...(config.compaction || {}), auto: true } };
-  delete lean.compaction.prune;
-  for (const k of keys) {
-    lean[k] = config[k].filter((e) => !isMagicEntry(e));
-    if (!lean[k].length) delete lean[k];
-  }
-  return lean;
-}
-const SKIP_COPY = /^(opencode\.jsonc?|service\.json)$|\.(bak|backup)|\.lock$/i;
-function jobConfigDir() {
-  if (workerSet().magic) return "";
-  let lean;
-  try {
-    if (existsSync(join(OC_CONFIG_DIR, "opencode.jsonc"))) return ""; // comments: not something to rewrite blind
-    lean = withoutMagic(JSON.parse(readFileSync(join(OC_CONFIG_DIR, "opencode.json"), "utf8")));
-  } catch {
-    return "";
-  }
-  if (!lean) return "";
-  try {
-    mkdirSync(JOB_CONFIG_DIR, { recursive: true });
-    for (const e of readdirSync(OC_CONFIG_DIR, { withFileTypes: true }))
-      if (!SKIP_COPY.test(e.name)) cpSync(join(OC_CONFIG_DIR, e.name), join(JOB_CONFIG_DIR, e.name), { recursive: true, force: true });
-    const file = join(JOB_CONFIG_DIR, "opencode.json");
-    const text = JSON.stringify(lean, null, 2) + "\n";
-    let old = "";
-    try {
-      old = readFileSync(file, "utf8");
-    } catch {}
-    if (old !== text) {
-      const tmp = `${file}.${process.pid}.tmp`;
-      writeFileSync(tmp, text);
-      try {
-        renameSync(tmp, file);
-      } catch {
-        // another job wrote it at the same moment (Windows refuses to replace an open file): then it is the same text
-        try {
-          unlinkSync(tmp);
-        } catch {}
-        if (readFileSync(file, "utf8") !== text) return "";
-      }
-    }
-    return JOB_CONFIG_DIR;
-  } catch {
-    return "";
-  }
+async function missingSignIn(svc, model, cwd) {
+  const provider = model.split("/")[0];
+  if (!provider || findModel(model)?.local || findModel(model)?.free) return "";
+  const rows = await profile.integrations(svc, cwd);
+  const status = profile.signInStatus(rows, provider);
+  // The standalone auth list contains only connected integrations. A remote worker
+  // still needs an actionable error when its provider is absent from that list.
+  if (status !== "Missing" && status !== "Sign in again" && (svc || rows.some(r => r.id === provider))) return "";
+  const helper = fileURLToPath(new URL("./bridge-auth.mjs", import.meta.url));
+  return `Worker provider "${provider}" ${status === "Sign in again" ? "needs a fresh sign-in" : "has no sign-in"}. Sign in for workers in OpenCode Config Studio › Workers, or run: node "${helper}" login ${provider}`;
 }
 
 // Asks the service to interrupt the session's run (`session.interrupt`), then looks whether it went idle.
-async function stopSession(session) {
+async function stopSession(session, mode) {
   let interrupted = null;
   try {
-    interrupted = !!(await ocApi("session.interrupt", [`sessionID=${session}`], 8000))?.interrupted;
+    interrupted = !!(await ocApi("session.interrupt", [`sessionID=${session}`], 8000, mode))?.interrupted;
   } catch {
     // an OpenCode without this call, or no service running
   }
   let busy = null;
   for (let i = 0; i < 4; i++) {
     await sleep(i ? 1500 : 400);
-    busy = await sessionBusy(session);
+    busy = await sessionBusy(session, mode);
     if (busy !== true) break;
   }
   return { interrupted, busy };
@@ -1450,7 +1424,37 @@ function absorbClaude(job, acc, ev) {
   }
 }
 
-function runAgent(job, { prompt, directory, files = [], allow_edits = false, agent, session, effort, model, _w }) {
+async function runAgent(job, args) {
+  let lease;
+  try {
+    if (!isClaudeJob(args) && !workerSet().magic) {
+      lease = await profile.acquire();
+      const cwd = args.directory && existsSync(args.directory) ? resolve(args.directory) : process.cwd();
+      let ref = args.model;
+      if (lease.svc) {
+        // The job's directory can override a global agent's model and permissions.
+        await profile.warm(lease.svc, cwd);
+        const name = args.agent || pickAgent(args);
+        const agents = (await profile.api(lease.svc, `/api/agent?directory=${encodeURIComponent(cwd)}`)).data;
+        const agent = agents.find(a => a.id === name);
+        if (!agent) return finish(job, "failed", `Unknown worker agent "${name}" in ${cwd}.`);
+        if (!args.allow_edits && !guardedAgent(agent)) return finish(job, "failed", `Agent "${name}" can edit without asking in ${cwd}; it cannot run a read-only job.`);
+        if (!ref && agent.model?.providerID && agent.model?.id) ref = refOf(agent.model);
+      }
+      ref ||= profile.configModel(args.agent || pickAgent(args)) || resolveModel(args);
+      if (offReason(ref)) return finish(job, "failed", switchedOff(ref));
+      const missing = await missingSignIn(lease.svc, ref, cwd);
+      if (missing) return finish(job, "failed", missing);
+      if (args.effort && !args.model) args.model = ref; // use the same project model that we checked
+    }
+    if (job.cancelled || cancelAsked(job.state.id)) return finish(job, "cancelled", "cancelled before it started");
+    return await runClient(job, args, lease);
+  } catch (e) {
+    return finish(job, "failed", `Could not prepare OpenCode worker: ${e.message.split("\n")[0]}`);
+  } finally { lease?.release(); }
+}
+
+function runClient(job, { prompt, directory, files = [], allow_edits = false, agent, session, effort, model, _w }, lease) {
   return new Promise((resolve) => {
     const s = job.state;
     const claude = isClaudeJob({ model, session, agent, _w });
@@ -1463,7 +1467,6 @@ function runAgent(job, { prompt, directory, files = [], allow_edits = false, age
     let exe = OPENCODE_EXE;
     let args;
     let ocArgs;
-    let jobDir = "";
     if (claude) {
       exe = CLAUDE_EXE;
       // headless, JSON events, no MCP servers (so a worker never starts this bridge again);
@@ -1482,11 +1485,11 @@ function runAgent(job, { prompt, directory, files = [], allow_edits = false, age
       const chosen = pickAgent({ agent, allow_edits });
       // effort alone applies to the agent's own model, not always to OPENCODE_MODEL
       const ref = model || (effort ? resolveModel({ agent, allow_edits }) : "");
-      jobDir = jobConfigDir();
-      s.magicContext = !jobDir;
+      s.serviceMode = lease ? (lease.svc ? "worker" : "standalone") : "owner";
+      s.magicContext = !lease;
       ocArgs = (ses, attach) => {
         const a = ["run", "--format", "json", "--archived", "--agent", chosen];
-        if (jobDir) a.push("--standalone");
+        if (lease) a.push(...profile.targetArgs(lease.svc));
         if (ses) a.push("--session", ses);
         else a.push("--title", "claude-delegate");
         if (ref) a.push("--model", effort ? `${ref}#${effort}` : ref);
@@ -1507,7 +1510,7 @@ function runAgent(job, { prompt, directory, files = [], allow_edits = false, age
       spawn(exe, withArgs, {
         cwd,
         // OpenCode takes its working folder from PWD when set, and an inherited PWD is this server's folder
-        env: claude ? claudeEnv(cwd) : { ...process.env, PWD: cwd, ...(jobDir ? { OPENCODE_CONFIG_DIR: jobDir } : {}) },
+        env: claude ? claudeEnv(cwd) : lease ? profile.environment(lease.svc, cwd) : { ...process.env, PWD: cwd },
         stdio: ["pipe", "pipe", "pipe"],
         windowsHide: true,
         detached: process.platform !== "win32",
@@ -1527,7 +1530,7 @@ function runAgent(job, { prompt, directory, files = [], allow_edits = false, age
 
     // continuing a session whose earlier run never stopped would wait behind it without a word: say so
     if (!claude && session)
-      sessionBusy(session).then((busy) => {
+      sessionBusy(session, s.serviceMode).then((busy) => {
         if (busy && !ended) {
           s.note = "its session was still busy with an earlier run when this job started; opencode_cancel on the earlier job interrupts that run";
           saveState(s);
@@ -1548,7 +1551,7 @@ function runAgent(job, { prompt, directory, files = [], allow_edits = false, age
       // `opencode run` is a client of OpenCode's background service: the session and its tools (a build) run
       // there, so killing the client is not enough. Ask the service to interrupt the session, and report the outcome.
       if (claude || !s.session) return done(resumeNote({ claude, session: s.session }));
-      const stopping = stopSession(s.session);
+      const stopping = stopSession(s.session, s.serviceMode);
       if (fast) return done(resumeNote({ session: s.session, interrupted: null, busy: null }));
       stopping.then((r) => done(resumeNote({ session: s.session, ...r })));
     };
@@ -1567,7 +1570,7 @@ function runAgent(job, { prompt, directory, files = [], allow_edits = false, age
     const askFlight = () => {
       const asked = s.lastEvent;
       probe.busy = true;
-      sessionMessages(s.session)
+      sessionMessages(s.session, s.serviceMode)
         .then(
           (data) => findRunningTool(data),
           () => ({ unknown: true, label: "a tool call (OpenCode could not say which)", since: asked }),
@@ -1624,10 +1627,17 @@ function runAgent(job, { prompt, directory, files = [], allow_edits = false, age
       saveState(s);
       await sleep(RESUME_WAIT_MS);
       if (ended) return;
-      if ((await sessionBusy(s.session)) === true) await stopSession(s.session);
+      if ((await sessionBusy(s.session, s.serviceMode)) === true) await stopSession(s.session, s.serviceMode);
       if (ended) return;
       mark();
       try {
+        if (lease?.svc) {
+          const replacement = await profile.acquire();
+          lease.release();
+          Object.assign(lease, replacement);
+          s.serviceMode = lease.svc ? "worker" : "standalone";
+          if (ended) { lease.release(); return; }
+        }
         child = start(ocArgs(s.session, []));
       } catch (e) {
         acc.errors.push(`spawn failed: ${e.message}`);
@@ -1867,7 +1877,7 @@ async function stopLeftover(s) {
   if (!ses) return "";
   const user = pendingStates().find((p) => p.session === ses && p.id !== s.id);
   if (user) return `its session ${ses} is in use by ${user.id}; cancel that job to stop it`;
-  return resumeNote({ session: ses, ...(await stopSession(ses)) });
+  return resumeNote({ session: ses, ...(await stopSession(ses, s.serviceMode)) });
 }
 const resumeLine = (reply) => /^resume: .*$/m.exec(reply || "")?.[0] || "";
 
@@ -1934,7 +1944,7 @@ const send = (msg) => process.stdout.write(JSON.stringify(msg) + "\n");
 // What this client offers, kept for opencode_list and in clients.jsonl: whether a client can take a long job as an
 // MCP task (the io.modelcontextprotocol/tasks extension) is known only from what it sends.
 const TASKS_EXT = "io.modelcontextprotocol/tasks";
-const VERSION = "3.3.0";
+const VERSION = "3.4.0";
 
 // ---- MCP tasks (OPENCODE_TASKS=1) ----
 // With protocol 2026-07-28 and the tasks extension a client takes a long job as a task: opencode_run returns at
@@ -2058,6 +2068,7 @@ async function handle(msg) {
     return;
   }
   if (method === "tools/list") {
+    demandCatalog();
     // first run in this folder: wait (bounded) for the live list; otherwise the cache answers at once
     if (!catalog && refreshing) await Promise.race([refreshing, new Promise((r) => setTimeout(r, 10000))]);
     const run = buildTool();
@@ -2168,8 +2179,6 @@ if (process.env.OPENCODE_BRIDGE_NO_MAIN !== "1") {
   process.stdin.on("end", shutdown);
   process.on("SIGTERM", shutdown);
 
-  // read the live catalog now; with a cached one, tools/list doesn't wait for it
-  refreshCatalog();
   setTimeout(pruneFiles, 5000).unref();
   // the worker list is the tool's description: tell the client when the user changes it
   for (const file of [WORKERS_FILE, LEGACY_WORKERS_FILE])

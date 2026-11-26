@@ -2,7 +2,9 @@
 // Part 1 checks the rules that need no process (queue places, idle limits, the result line).
 // Part 2 drives the real server over MCP stdio against test/fake-opencode.mjs, so no model is called.
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
+import { promisify } from "node:util";
+import { randomBytes } from "node:crypto";
 import { copyFileSync, existsSync, linkSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { delimiter, dirname, join } from "node:path";
@@ -45,6 +47,9 @@ process.env.OPENCODE_BRIDGE_NO_MAIN = "1";
 process.env.OPENCODE_STATE_DIR = join(root, "unit-state");
 process.env.OPENCODE_CLAUDE = "0";
 process.env.OPENCODE_CONFIG_DIR = join(root, "no-oc-config");
+process.env.BRIDGE_JOB_HOME = join(root, "workers");
+delete process.env.OPENCODE_DB;
+delete process.env.BRIDGE_JOB_CONFIG_DIR;
 const bridge = await import(pathToFileURL(serverFile).href);
 
 await test("a queue place is free when its heartbeat stopped, its server died or its job ended", () => {
@@ -134,9 +139,7 @@ class Server {
     this.next = 1;
     this.waiting = new Map();
     this.notes = []; // notifications from the server
-    this.child = spawn(process.execPath, [serverFile], {
-      stdio: ["pipe", "pipe", "inherit"],
-      env: {
+    this.env = {
         ...process.env,
         PATH: binDir + delimiter + process.env.PATH,
         OPENCODE_EXE: fakeExe,
@@ -145,6 +148,7 @@ class Server {
         FAKE_REAL_NODE: process.execPath,
         OPENCODE_STATE_DIR: join(root, name),
         OPENCODE_BRIDGE_NO_MAIN: "",
+        OPENCODE_TASKS: "",
         OPENCODE_CLAUDE: "0",
         OPENCODE_PROBE_MS: "500",
         OPENCODE_SERVICE_FILE: join(root, "no-service.json"),
@@ -154,8 +158,8 @@ class Server {
         CLAUDE_WORKERS_FILE: join(root, "no-claude-workers.json"),
         OPENCODE_CONFIG_DIR: join(root, "no-oc-config"), // the user's real OpenCode config stays out of the tests
         ...env,
-      },
-    });
+    };
+    this.child = spawn(process.execPath, [serverFile], { stdio: ["pipe", "pipe", "inherit"], env: this.env });
     let buf = "";
     this.child.stdout.on("data", (d) => {
       buf += d;
@@ -596,6 +600,7 @@ await test("with OPENCODE_TASKS a job is an MCP task: the run returns at once an
   const second = (await look()).result.content[0].text;
   assert.equal(second, `${long.taskId} still running. Its reply is delivered to you when it ends. Do not look again: carry on with other work, or end the turn if nothing else is left.`);
   assert.ok(Date.now() - before < 3000, "a look does not wait");
+  await until("task's client to start", () => JSON.parse(readFileSync(join(root,"state-tasks",`${long.taskId}.json`))).status === "running");
   assert.deepEqual((await t.rpc("tasks/cancel", { taskId: long.taskId, ...meta() })).result, { resultType: "complete" });
   const gone = (await t.rpc("tasks/get", { taskId: long.taskId, ...meta() })).result;
   assert.equal(gone.status, "completed");
@@ -603,7 +608,7 @@ await test("with OPENCODE_TASKS a job is an MCP task: the run returns at once an
   assert.match(gone.result.content[0].text, /^status: cancelled/);
 
   // the older protocol still works on the same server
-  assert.equal((await t.start()).serverInfo.version, "3.2.1");
+  assert.equal((await t.start()).serverInfo.version, "3.4.0");
   t.stop();
 });
 
@@ -654,31 +659,88 @@ await test("the job's config leaves Magic Context out and turns OpenCode's own c
   assert.deepEqual(bridge.withoutMagic({ plugin: [["@cortexkit/opencode-magic-context", {}]] }), { compaction: { auto: true } }, "the older key, an entry with options, an emptied list dropped");
 });
 
-await test("an OpenCode job runs on a private server with that config, unless workers.json keeps the plugin", async () => {
+await test("two bridges share one worker service, defer config changes until idle, and keep personal mode separate", async () => {
   const ocDir = join(root, "oc-config");
   const jobs = join(root, "oc-jobs");
   mkdirSync(ocDir, { recursive: true });
   writeFileSync(join(ocDir, "opencode.json"), JSON.stringify({ plugins: ["@cortexkit/opencode-magic-context@latest"], compaction: { auto: false } }));
   writeFileSync(join(ocDir, "cli.json"), "{}");
   writeFileSync(join(ocDir, "service.json"), "{}");
-  const runLog = () => readFileSync(join(fakeDir, "run.log"), "utf8").trim().split("\n").map((l) => JSON.parse(l));
-  const lean = new Server("state-lean", { OPENCODE_CONFIG_DIR: ocDir, BRIDGE_JOB_CONFIG_DIR: jobs });
-  await lean.result(await lean.run({ prompt: "FAKE:quick" }));
-  lean.stop();
+  const dir = join(root,"lean-fake");
+  const runLog = () => readFileSync(join(dir, "run.log"), "utf8").trim().split("\n").map((l) => JSON.parse(l));
+  const env = { FAKE_DIR:dir, OPENCODE_CONFIG_DIR: ocDir, BRIDGE_JOB_CONFIG_DIR: jobs, BRIDGE_JOB_HOME:join(root,"lean-profile") };
+  const lean = new Server("state-lean", env), peer = new Server("state-peer", env);
+  const ids = await Promise.all([lean.run({prompt:"FAKE:hang:3000"}), peer.run({prompt:"FAKE:quick"})]);
+  assert.match((await peer.result(ids[1])).text,/PONG/);
+  const count = () => readFileSync(join(dir,"services.log"),"utf8").split("\n").filter(l => l.includes("lean-profile")).length;
+  const contract = JSON.parse(readFileSync(join(env.BRIDGE_JOB_HOME,"job-service.json")));
+  assert.ok(contract.address && contract.env.OPENCODE_DB.startsWith(env.BRIDGE_JOB_HOME));
+  assert.ok(!/password|token/i.test(JSON.stringify(contract)));
+  writeFileSync(join(ocDir,"cli.json"), '{"new":true}');
+  assert.match((await peer.result(await peer.run({prompt:"FAKE:quick"}))).text,/PONG/);
+  assert.equal(count(),1);
+  assert.equal(readFileSync(join(jobs,"cli.json"),"utf8"),"{}");
+  await lean.result(ids[0]);
+  await lean.result(await lean.run({prompt:"FAKE:quick"}));
+  assert.equal(count(),2);
+  assert.equal(readFileSync(join(jobs,"cli.json"),"utf8"),'{"new":true}');
+  lean.stop(); peer.stop();
   const last = runLog().at(-1);
-  assert.ok(last.args.includes("--standalone"), last.args.join(" "));
+  assert.ok(last.args.includes("--server") && !last.args.includes("--standalone"), last.args.join(" "));
   assert.equal(last.configDir, jobs);
   assert.deepEqual(JSON.parse(readFileSync(join(jobs, "opencode.json"), "utf8")), { compaction: { auto: true } });
   assert.ok(existsSync(join(jobs, "cli.json")), "the other config files come along");
   assert.ok(!existsSync(join(jobs, "service.json")), "the service's password does not");
   const keep = join(root, "keep-workers.json");
   writeFileSync(keep, JSON.stringify({ magicContextInJobs: true, workers: { w: { runs: "opencode", agent: "deepseek-flash" } } }));
-  const kept = new Server("state-kept", { OPENCODE_CONFIG_DIR: ocDir, BRIDGE_JOB_CONFIG_DIR: jobs, OPENCODE_ALLOW_ANY: "", BRIDGE_WORKERS_FILE: keep });
+  const kept = new Server("state-kept", { ...env, OPENCODE_ALLOW_ANY: "", BRIDGE_WORKERS_FILE: keep });
   await kept.result(await kept.run({ prompt: "FAKE:quick" }));
   kept.stop();
   const plain = runLog().at(-1);
   assert.ok(!plain.args.includes("--standalone"), plain.args.join(" "));
   assert.equal(plain.configDir, ocDir, "the user's own config, as before");
+});
+
+await test("unavailable service falls back to standalone with worker DB; sign-in commands and missing-key errors are scoped", async () => {
+  const fallback = new Server("fallback", { BRIDGE_JOB_HOME:join(root,"fallback-profile"), FAKE_NO_SERVICE:"1" });
+  assert.match((await fallback.result(await fallback.run({prompt:"FAKE:quick"}))).text,/^PONG/);
+  const last = JSON.parse(readFileSync(join(fakeDir,"run.log"),"utf8").trim().split("\n").at(-1));
+  assert.ok(last.args.includes("--standalone") && last.db.startsWith(fallback.env.BRIDGE_JOB_HOME));
+  writeFileSync(`${last.db}.missing`,"fake");
+  assert.match((await fallback.result(await fallback.run({prompt:"FAKE:quick"}))).text,/provider "fake".*bridge-auth.mjs/);
+  fallback.stop();
+  const srv = new Server("signin", { BRIDGE_JOB_HOME:join(root,"signin-profile") });
+  await srv.rpc("tools/list",{});
+  const db = join(srv.env.BRIDGE_JOB_HOME, "job-service","jobs.db"), helper = join(here,"..","bridge-auth.mjs");
+  const auth = (...args) => promisify(execFile)(process.execPath,[helper,...args],{env:srv.env,timeout:15000});
+  writeFileSync(`${db}.missing`,"fake");
+  const before = readFileSync(join(fakeDir,"run.log"),"utf8");
+  const result = await srv.result(await srv.run({prompt:"FAKE:quick"}));
+  assert.match(result.text,/provider "fake".*Config Studio › Workers.*bridge-auth.mjs" login fake/);
+  assert.equal(readFileSync(join(fakeDir,"run.log"),"utf8"),before);
+  assert.deepEqual(JSON.parse((await auth("status")).stdout).providers,[{id:"fake",status:"Missing",key:true,stored:false}]);
+  const key = randomBytes(32);
+  const sent = execFile(process.execPath,[helper,"key","fake"],{env:srv.env},()=>{});
+  sent.stdin.end(key.toString("hex")); key.fill(0);
+  assert.equal(await new Promise(done=>sent.on("exit",done)),0);
+  assert.match((await auth("status")).stdout,/Signed in/);
+  const overrideFile = join(root, "worker-auth-status.json");
+  writeFileSync(overrideFile,JSON.stringify({workers:{
+    inherited:{runs:"opencode",agent:"deepseek-flash"}, override:{runs:"opencode",agent:"deepseek-flash",model:"openai/gpt"},
+    off:{runs:"opencode",disabled:true,model:"other/model"},claude:{runs:"claude",model:"opus"},
+  }}));
+  const status = await promisify(execFile)(process.execPath,[helper,"status"],{env:{...srv.env, BRIDGE_WORKERS_FILE:overrideFile}});
+  assert.deepEqual(JSON.parse(status.stdout).providers.map(p=>p.id),["fake","openai"]);
+  for (const a of [["list"],["login","fake"],["logout","fake"]]) await auth(...a);
+  const actions = readFileSync(join(fakeDir,"auth.log"),"utf8").trim().split("\n").map(x=>JSON.parse(x));
+  assert.deepEqual(actions.map(a=>a.action),["list","login","logout"]); assert.ok(actions.every(a=>a.db===db));
+  assert.match((await srv.result(await srv.run({prompt:"FAKE:quick"}))).text,/^PONG/);
+  const history = `${db}.sessions`, old = {archived:1,updated:1};
+  writeFileSync(history,JSON.stringify([{id:"old",time:old},{id:"parent",time:old},
+    {id:"child",parentID:"parent",time:{updated:1}},{id:"recent",time:{archived:1,updated:Date.now()}}]));
+  assert.match((await auth("prune","30")).stdout,/Removed 1/);
+  assert.deepEqual(JSON.parse(readFileSync(history)).map(s=>s.id),["parent","child","recent"]);
+  srv.stop();
 });
 
 for (const pid of strays) {
@@ -689,6 +751,13 @@ for (const pid of strays) {
   }
 }
 await sleep(500);
+// Only the fakes with a registration created in this test's unique scratch root.
+for (const folder of ["workers","lean-profile","signin-profile"]) {
+  const file = join(root,folder,"job-service","state","opencode","service.json");
+  if (!existsSync(file)) continue;
+  const svc = JSON.parse(readFileSync(file,"utf8"));
+  await fetch(svc.url+"/test/stop",{headers:{authorization:`Basic ${Buffer.from("opencode:"+svc.password).toString("base64")}`}});
+}
 try {
   rmSync(root, { recursive: true, force: true });
 } catch {
