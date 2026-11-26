@@ -521,6 +521,19 @@ await test("opencode_list names the workers and how long a wait may be", async (
   assert.match(list, /^Workers:\nflash \(OpenCode agent deepseek-flash/m);
   assert.match(list, /This server: client "claude-code" 0, protocol 2025-06-18, MCP tasks not offered; one opencode_result call waits up to 1500 s\.$/);
 });
+await test("opencode_list names this session's ended jobs whose reply nobody collected", async () => {
+  const started = (await listed.call("opencode_run", { prompt: "FAKE:quick" })).text;
+  assert.match(started, /Nothing wakes you when a job ends: do not end your turn before you have its reply\.$/);
+  const job = /job_[a-z0-9]+_\d+/.exec(started)[0];
+  let list = "";
+  await until("the ended job is listed as not collected", async () => {
+    list = (await listed.call("opencode_list")).text;
+    return list.includes("Ended, reply NOT collected yet (yours):");
+  });
+  assert.ok(list.includes(`${job} done: call opencode_result { job: "${job}" } for its reply`), list);
+  await listed.call("opencode_result", { job });
+  assert.ok(!(await listed.call("opencode_list")).text.includes("NOT collected"));
+});
 listed.stop();
 
 await test("without OPENCODE_TASKS the newer protocol is unknown, so a client falls back to initialize", async () => {
@@ -588,7 +601,7 @@ await test("with OPENCODE_TASKS a job is an MCP task: the run returns at once an
   assert.match(gone.result.content[0].text, /^status: cancelled/);
 
   // the older protocol still works on the same server
-  assert.equal((await t.start()).serverInfo.version, "3.2.0");
+  assert.equal((await t.start()).serverInfo.version, "3.2.1");
   t.stop();
 });
 

@@ -1035,6 +1035,7 @@ const PREFIX = `job_${process.pid.toString(36)}`;
 let nextJob = 1;
 const jobs = new Map(); // this instance's jobs: id -> { state, promise, child, cancel }
 const delivered = new Set(); // jobs whose reply a multi-job result call already returned
+const collected = new Set(); // jobs whose reply reached the caller in any way: the list names the others
 
 const statePath = (id) => join(STATE_DIR, `${id}.json`);
 const logPath = (id) => join(STATE_DIR, `${id}.jsonl`);
@@ -1767,8 +1768,14 @@ async function listText() {
   const queued = states.filter((s) => s.status === "queued");
   const lines = states.length ? states.map((s) => listLine(s, queued)) : ["No job is queued or running."];
   const who = ALLOW_ANY ? ["Workers: any OpenCode agent or model (OPENCODE_ALLOW_ANY)"] : ["Workers:", ...workerLines()];
+  // this session's own jobs that ended while nobody was waiting: without tasks nothing else tells the caller
+  const ended = [...jobs.values()].map((j) => j.state).filter((st) => !isPending(st) && !collected.has(st.id));
+  const uncollected = ended.length
+    ? ["", "Ended, reply NOT collected yet (yours):", ...ended.map((st) => `${st.id} ${st.status}: call opencode_result { job: "${st.id}" } for its reply`)]
+    : [];
   return [
     ...lines,
+    ...uncollected,
     "",
     "Places:",
     ...poolLines(),
@@ -1854,7 +1861,7 @@ const send = (msg) => process.stdout.write(JSON.stringify(msg) + "\n");
 // What this client offers, kept for opencode_list and in clients.jsonl: whether a client can take a long job as an
 // MCP task (the io.modelcontextprotocol/tasks extension) is known only from what it sends.
 const TASKS_EXT = "io.modelcontextprotocol/tasks";
-const VERSION = "3.2.0";
+const VERSION = "3.2.1";
 
 // ---- MCP tasks (OPENCODE_TASKS=1) ----
 // With protocol 2026-07-28 and the tasks extension a client takes a long job as a task: opencode_run returns at
@@ -1947,7 +1954,10 @@ async function handle(msg) {
         if (isPending(f.state)) await cancelJob(f.state.id);
         return out({ jsonrpc: "2.0", id, result: {} });
       }
-      if (!isPending(f.state)) delivered.add(f.state.id);
+      if (!isPending(f.state)) {
+        delivered.add(f.state.id);
+        collected.add(f.state.id);
+      }
       return out({ jsonrpc: "2.0", id, result: taskOf(f.state) });
     }
   }
@@ -1998,7 +2008,7 @@ async function handle(msg) {
       const on = a._w ? ` on worker ${a._w.name} (${model})` : a.model || a.effort ? ` on ${model}` : "";
       if (modern && offersTasks(params))
         return out({ jsonrpc: "2.0", id, result: { resultType: "task", ...taskOf(s), statusMessage: `started ${job}${on}${waiting}; its reply is delivered when it ends` } });
-      return reply(`started ${job}${on}${waiting}, limit ${s.timeoutMs / 1000}s, idle ${s.idleMs / 1000}s. Wait for it with one call: opencode_result { job: "${job}" } (or several ids at once as \`jobs\`); it returns when the job ends.`);
+      return reply(`started ${job}${on}${waiting}, limit ${s.timeoutMs / 1000}s, idle ${s.idleMs / 1000}s. Wait for it with one call: opencode_result { job: "${job}" } (or several ids at once as \`jobs\`); it returns when the job ends. Nothing wakes you when a job ends: do not end your turn before you have its reply.`);
     }
     if (params?.name === "opencode_result") {
       const ids = [...new Set([...(Array.isArray(a.jobs) ? a.jobs : []), ...(a.job ? [a.job] : [])].map(String))];
@@ -2046,6 +2056,7 @@ async function handle(msg) {
         const s = found.get(ids[0]).state;
         if (pending(s)) return reply(asTask ? `${progressOne(s)}
 ${TASK_WAIT}` : progressOne(s));
+        collected.add(ids[0]);
         return reply(s.reply || `${ids[0]} ${s.status}`, !s.ok);
       }
       const parts = [];
@@ -2057,6 +2068,7 @@ ${TASK_WAIT}` : progressOne(s));
         else if (!fresh(jid)) lines.push(`${jid}: ${f.state.status}, reply already returned (opencode_result { job: "${jid}" } returns it again)`);
         else {
           delivered.add(jid);
+          collected.add(jid);
           parts.push(`## ${jid} · ${f.state.status}\n${f.state.reply || f.state.status}`);
         }
       }
