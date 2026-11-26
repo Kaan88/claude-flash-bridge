@@ -12,7 +12,7 @@
 // into the tool description; Claude is told (tools/list_changed) when a refresh changes them.
 import { execFile, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import { createWriteStream, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, statSync, unlinkSync, utimesSync, watchFile, writeFileSync } from "node:fs";
+import { cpSync, createWriteStream, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, statSync, unlinkSync, utimesSync, watchFile, writeFileSync } from "node:fs";
 import { createInterface } from "node:readline";
 import { homedir, tmpdir } from "node:os";
 import { delimiter, isAbsolute, join, resolve } from "node:path";
@@ -83,7 +83,7 @@ export function readWorker(name, w, legacy = false) {
   if (runs !== "opencode" || typeof w.agent !== "string" || !w.agent) return null;
   return { ...base, agent: w.agent, model: typeof w.model === "string" ? w.model.replace(/#.*$/, "") : "", effort: typeof w.effort === "string" ? w.effort : "" };
 }
-let workersCache = { key: "", list: {}, def: "", accounts: [], use: "same" };
+let workersCache = { key: "", list: {}, def: "", accounts: [], use: "same", magic: false };
 function workerSet() {
   const mtime = mtimeOf(WORKERS_FILE);
   const legacy = mtime ? 0 : mtimeOf(LEGACY_WORKERS_FILE);
@@ -93,11 +93,13 @@ function workerSet() {
   let def = "";
   let accounts = [];
   let use = "same";
+  let magic = false;
   try {
     if (mtime) {
       const raw = JSON.parse(readFileSync(WORKERS_FILE, "utf8"));
       accounts = Array.isArray(raw.claudeAccounts) ? raw.claudeAccounts.filter((d) => typeof d === "string" && d) : [];
       use = typeof raw.claudeWorkersUse === "string" && raw.claudeWorkersUse ? raw.claudeWorkersUse : "same";
+      magic = raw.magicContextInJobs === true;
       for (const [name, w] of Object.entries(raw.workers || {})) {
         const entry = readWorker(name, w);
         if (entry) list[name] = entry;
@@ -114,9 +116,9 @@ function workerSet() {
     // no default named: the first OpenCode worker (work that leaves the Claude plan alone), else the first one
     def ||= Object.values(list).find((w) => w.runs === "opencode")?.name || Object.keys(list)[0] || "";
   } catch {
-    ({ list, def, accounts, use } = workersCache); // half-written or invalid: keep the last good list
+    ({ list, def, accounts, use, magic } = workersCache); // half-written or invalid: keep the last good list
   }
-  workersCache = { key, list, def, accounts, use };
+  workersCache = { key, list, def, accounts, use, magic };
   return workersCache;
 }
 // The Claude Code workers alone, by name (what `agent` could name before there was one list).
@@ -1262,6 +1264,73 @@ const RESUME_PROMPT =
   "A command that was running at that moment did not finish: check what it left behind before relying on it. " +
   "Then carry on with the task from where you stopped, and reply as the task asked.";
 
+// Magic Context in jobs. The plugin is loaded by the OpenCode server that runs a session, and an agent's opt-out line
+// only drops its prompt text (ctx_reduce, the historian and its compaction stay). So unless workers.json says
+// "magicContextInJobs": true, an OpenCode job runs on a private server (`--standalone`) whose config folder
+// (OPENCODE_CONFIG_DIR) is a copy of the user's, made again before each job, with the plugin left out and OpenCode's
+// own compaction on. Sign-ins, sessions and the database are not in the config folder, so they stay shared, and the
+// user's own OpenCode keeps the plugin. With no plugin listed, or a config that can't be read, jobs use the service.
+const OC_CONFIG_DIR = process.env.OPENCODE_CONFIG_DIR || join(homedir(), ".config", "opencode");
+const JOB_CONFIG_DIR = process.env.BRIDGE_JOB_CONFIG_DIR || join(homedir(), ".config", "opencode-bridge", "opencode-jobs");
+const MAGIC_PACKAGE = "@cortexkit/opencode-magic-context";
+const pluginName = (e) => String(typeof e === "string" ? e : Array.isArray(e) ? e[0] : e?.name || e?.package || "");
+const isMagicEntry = (e) => {
+  const n = pluginName(e);
+  return n === MAGIC_PACKAGE || n.startsWith(MAGIC_PACKAGE + "@");
+};
+// The config without the plugin and with OpenCode's own compaction on (as Studio's Context switch writes it), or
+// null when the plugin is not listed.
+export function withoutMagic(config) {
+  const keys = ["plugins", "plugin"].filter((k) => Array.isArray(config?.[k]) && config[k].some(isMagicEntry));
+  if (!keys.length) return null;
+  const lean = { ...config, compaction: { ...(config.compaction || {}), auto: true } };
+  delete lean.compaction.prune;
+  for (const k of keys) {
+    lean[k] = config[k].filter((e) => !isMagicEntry(e));
+    if (!lean[k].length) delete lean[k];
+  }
+  return lean;
+}
+const SKIP_COPY = /^(opencode\.jsonc?|service\.json)$|\.(bak|backup)|\.lock$/i;
+function jobConfigDir() {
+  if (workerSet().magic) return "";
+  let lean;
+  try {
+    if (existsSync(join(OC_CONFIG_DIR, "opencode.jsonc"))) return ""; // comments: not something to rewrite blind
+    lean = withoutMagic(JSON.parse(readFileSync(join(OC_CONFIG_DIR, "opencode.json"), "utf8")));
+  } catch {
+    return "";
+  }
+  if (!lean) return "";
+  try {
+    mkdirSync(JOB_CONFIG_DIR, { recursive: true });
+    for (const e of readdirSync(OC_CONFIG_DIR, { withFileTypes: true }))
+      if (!SKIP_COPY.test(e.name)) cpSync(join(OC_CONFIG_DIR, e.name), join(JOB_CONFIG_DIR, e.name), { recursive: true, force: true });
+    const file = join(JOB_CONFIG_DIR, "opencode.json");
+    const text = JSON.stringify(lean, null, 2) + "\n";
+    let old = "";
+    try {
+      old = readFileSync(file, "utf8");
+    } catch {}
+    if (old !== text) {
+      const tmp = `${file}.${process.pid}.tmp`;
+      writeFileSync(tmp, text);
+      try {
+        renameSync(tmp, file);
+      } catch {
+        // another job wrote it at the same moment (Windows refuses to replace an open file): then it is the same text
+        try {
+          unlinkSync(tmp);
+        } catch {}
+        if (readFileSync(file, "utf8") !== text) return "";
+      }
+    }
+    return JOB_CONFIG_DIR;
+  } catch {
+    return "";
+  }
+}
+
 // Asks the service to interrupt the session's run (`session.interrupt`), then looks whether it went idle.
 async function stopSession(session) {
   let interrupted = null;
@@ -1394,6 +1463,7 @@ function runAgent(job, { prompt, directory, files = [], allow_edits = false, age
     let exe = OPENCODE_EXE;
     let args;
     let ocArgs;
+    let jobDir = "";
     if (claude) {
       exe = CLAUDE_EXE;
       // headless, JSON events, no MCP servers (so a worker never starts this bridge again);
@@ -1412,8 +1482,11 @@ function runAgent(job, { prompt, directory, files = [], allow_edits = false, age
       const chosen = pickAgent({ agent, allow_edits });
       // effort alone applies to the agent's own model, not always to OPENCODE_MODEL
       const ref = model || (effort ? resolveModel({ agent, allow_edits }) : "");
+      jobDir = jobConfigDir();
+      s.magicContext = !jobDir;
       ocArgs = (ses, attach) => {
         const a = ["run", "--format", "json", "--archived", "--agent", chosen];
+        if (jobDir) a.push("--standalone");
         if (ses) a.push("--session", ses);
         else a.push("--title", "claude-delegate");
         if (ref) a.push("--model", effort ? `${ref}#${effort}` : ref);
@@ -1434,7 +1507,7 @@ function runAgent(job, { prompt, directory, files = [], allow_edits = false, age
       spawn(exe, withArgs, {
         cwd,
         // OpenCode takes its working folder from PWD when set, and an inherited PWD is this server's folder
-        env: claude ? claudeEnv(cwd) : { ...process.env, PWD: cwd },
+        env: claude ? claudeEnv(cwd) : { ...process.env, PWD: cwd, ...(jobDir ? { OPENCODE_CONFIG_DIR: jobDir } : {}) },
         stdio: ["pipe", "pipe", "pipe"],
         windowsHide: true,
         detached: process.platform !== "win32",
@@ -1861,7 +1934,7 @@ const send = (msg) => process.stdout.write(JSON.stringify(msg) + "\n");
 // What this client offers, kept for opencode_list and in clients.jsonl: whether a client can take a long job as an
 // MCP task (the io.modelcontextprotocol/tasks extension) is known only from what it sends.
 const TASKS_EXT = "io.modelcontextprotocol/tasks";
-const VERSION = "3.2.1";
+const VERSION = "3.3.0";
 
 // ---- MCP tasks (OPENCODE_TASKS=1) ----
 // With protocol 2026-07-28 and the tasks extension a client takes a long job as a task: opencode_run returns at

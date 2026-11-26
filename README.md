@@ -74,6 +74,18 @@ account that is not that one, so workers spend the plan you are not working on) 
 account). A session of the desktop app is told apart by its account id, since it uses the standard folder whichever
 account it is signed in to. The bridge reads only `oauthAccount.accountUuid` from each folder's `.claude.json`.
 
+### Magic Context in jobs
+
+If OpenCode's config lists the Magic Context plugin (`@cortexkit/opencode-magic-context`), an OpenCode job does not
+get it: the bridge runs the job on a private server (`opencode run --standalone`) whose config folder
+(`OPENCODE_CONFIG_DIR`) is a copy of yours, made again before each job, with the plugin left out and OpenCode's own
+compaction on. It covers every worker and agent. The plugin's opt-out line in an agent's instructions is not enough:
+it only drops the plugin's prompt text, while `ctx_reduce`, its summaries and its compaction still run. Sign-ins,
+sessions and the database are outside the config folder, so they stay shared; the copy leaves out `service.json`.
+Your own OpenCode sessions keep the plugin. `"magicContextInJobs": true` in `workers.json` keeps it in jobs too.
+The copy lives in `~/.config/opencode-bridge/opencode-jobs` (`BRIDGE_JOB_CONFIG_DIR`). An `opencode.jsonc` config
+is not rewritten: jobs then use the service as before.
+
 For an OpenCode worker the bridge reads the agent's model and its effort levels from OpenCode
 (`opencode api model.list` / `agent.list`, cached per project folder), so `effort` is checked per model and a wrong
 level is refused with the valid ones. `OPENCODE_MODEL_EXCLUDE` and the blocklist file still switch a model off for

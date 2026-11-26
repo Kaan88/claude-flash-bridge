@@ -44,6 +44,7 @@ async function until(what, fn, ms = 15000) {
 process.env.OPENCODE_BRIDGE_NO_MAIN = "1";
 process.env.OPENCODE_STATE_DIR = join(root, "unit-state");
 process.env.OPENCODE_CLAUDE = "0";
+process.env.OPENCODE_CONFIG_DIR = join(root, "no-oc-config");
 const bridge = await import(pathToFileURL(serverFile).href);
 
 await test("a queue place is free when its heartbeat stopped, its server died or its job ended", () => {
@@ -151,6 +152,7 @@ class Server {
         OPENCODE_ALLOW_ANY: "1",
         BRIDGE_WORKERS_FILE: join(root, "no-workers.json"),
         CLAUDE_WORKERS_FILE: join(root, "no-claude-workers.json"),
+        OPENCODE_CONFIG_DIR: join(root, "no-oc-config"), // the user's real OpenCode config stays out of the tests
         ...env,
       },
     });
@@ -642,6 +644,41 @@ await test("the wait is 50 s unless set, and a worker entry is read strictly", (
   assert.equal(bridge.readWorker("x", { model: "opus" }), null, "no runs: not a worker of the new list");
   assert.deepEqual(bridge.readWorker("x", { model: "opus", effort: "high" }, true), { name: "x", runs: "claude", readOnly: false, description: "", model: "opus", effort: "high", instructions: "" });
   assert.deepEqual(bridge.readWorker("y", { runs: "opencode", agent: "a", model: "p/m#high" }), { name: "y", runs: "opencode", readOnly: false, description: "", agent: "a", model: "p/m", effort: "" });
+});
+
+await test("the job's config leaves Magic Context out and turns OpenCode's own compaction on", () => {
+  const magic = "@cortexkit/opencode-magic-context@latest";
+  assert.equal(bridge.withoutMagic({ plugins: ["other"] }), null, "no plugin: nothing to change");
+  const lean = bridge.withoutMagic({ model: "m", plugins: [magic, "other"], compaction: { auto: false, prune: false, keep: 3 } });
+  assert.deepEqual(lean, { model: "m", plugins: ["other"], compaction: { auto: true, keep: 3 } });
+  assert.deepEqual(bridge.withoutMagic({ plugin: [["@cortexkit/opencode-magic-context", {}]] }), { compaction: { auto: true } }, "the older key, an entry with options, an emptied list dropped");
+});
+
+await test("an OpenCode job runs on a private server with that config, unless workers.json keeps the plugin", async () => {
+  const ocDir = join(root, "oc-config");
+  const jobs = join(root, "oc-jobs");
+  mkdirSync(ocDir, { recursive: true });
+  writeFileSync(join(ocDir, "opencode.json"), JSON.stringify({ plugins: ["@cortexkit/opencode-magic-context@latest"], compaction: { auto: false } }));
+  writeFileSync(join(ocDir, "cli.json"), "{}");
+  writeFileSync(join(ocDir, "service.json"), "{}");
+  const runLog = () => readFileSync(join(fakeDir, "run.log"), "utf8").trim().split("\n").map((l) => JSON.parse(l));
+  const lean = new Server("state-lean", { OPENCODE_CONFIG_DIR: ocDir, BRIDGE_JOB_CONFIG_DIR: jobs });
+  await lean.result(await lean.run({ prompt: "FAKE:quick" }));
+  lean.stop();
+  const last = runLog().at(-1);
+  assert.ok(last.args.includes("--standalone"), last.args.join(" "));
+  assert.equal(last.configDir, jobs);
+  assert.deepEqual(JSON.parse(readFileSync(join(jobs, "opencode.json"), "utf8")), { compaction: { auto: true } });
+  assert.ok(existsSync(join(jobs, "cli.json")), "the other config files come along");
+  assert.ok(!existsSync(join(jobs, "service.json")), "the service's password does not");
+  const keep = join(root, "keep-workers.json");
+  writeFileSync(keep, JSON.stringify({ magicContextInJobs: true, workers: { w: { runs: "opencode", agent: "deepseek-flash" } } }));
+  const kept = new Server("state-kept", { OPENCODE_CONFIG_DIR: ocDir, BRIDGE_JOB_CONFIG_DIR: jobs, OPENCODE_ALLOW_ANY: "", BRIDGE_WORKERS_FILE: keep });
+  await kept.result(await kept.run({ prompt: "FAKE:quick" }));
+  kept.stop();
+  const plain = runLog().at(-1);
+  assert.ok(!plain.args.includes("--standalone"), plain.args.join(" "));
+  assert.equal(plain.configDir, ocDir, "the user's own config, as before");
 });
 
 for (const pid of strays) {

@@ -82,6 +82,7 @@ async function main() {
     process.stderr.write(`fake opencode: unknown command ${cmd}\n`);
     process.exit(1);
   }
+  appendFileSync(join(dir, "run.log"), JSON.stringify({ args: rest, configDir: process.env.OPENCODE_CONFIG_DIR || "" }) + "\n");
   let prompt = "";
   for await (const chunk of process.stdin) prompt += chunk;
   const [, kind = "quick", arg = "0"] = /FAKE:([a-z]+)(?::(\d+))?/.exec(prompt) || [];
