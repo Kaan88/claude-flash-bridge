@@ -192,7 +192,7 @@ class Server {
   async run(args) {
     const r = await this.call("opencode_run", args);
     assert.equal(r.isError, false, r.text);
-    return /started (job_[a-z0-9]+_\d+)/.exec(r.text)[1];
+    return /started (job_[a-z0-9]+_\d+(?:-[a-z0-9-]+)?)/.exec(r.text)[1];
   }
   // waits as a client must: opencode_result until the job is no longer running
   async result(job) {
@@ -464,7 +464,7 @@ writeFileSync(
   }),
 );
 const listed = new Server("state-workers", { OPENCODE_ALLOW_ANY: "", BRIDGE_WORKERS_FILE: workersFile, OPENCODE_PROGRESS_MS: "300", OPENCODE_WAIT_SECONDS: "1500" });
-const started = (text) => /started (job_[a-z0-9]+_\d+)/.exec(text)[1];
+const started = (text) => /started (job_[a-z0-9]+_\d+(?:-[a-z0-9-]+)?)/.exec(text)[1];
 await test("with a worker list the tool offers the workers and nothing else", async () => {
   await listed.start("claude-code");
   const { tools } = (await listed.rpc("tools/list", {})).result;
@@ -531,7 +531,7 @@ await test("opencode_list names the workers and how long a wait may be", async (
 await test("opencode_list names this session's ended jobs whose reply nobody collected", async () => {
   const started = (await listed.call("opencode_run", { prompt: "FAKE:quick" })).text;
   assert.match(started, /Nothing wakes you when a job ends: do not end your turn before you have its reply\.$/);
-  const job = /job_[a-z0-9]+_\d+/.exec(started)[0];
+  const job = /job_[a-z0-9]+_\d+(?:-[a-z0-9-]+)?/.exec(started)[0];
   let list = "";
   await until("the ended job is listed as not collected", async () => {
     list = (await listed.call("opencode_list")).text;
@@ -570,7 +570,7 @@ await test("with OPENCODE_TASKS a job is an MCP task: the run returns at once an
   const made = (await t.rpc("tools/call", { name: "opencode_run", arguments: { prompt: "FAKE:hang:1500" }, ...meta() })).result;
   assert.equal(made.resultType, "task");
   assert.equal(made.status, "working");
-  assert.match(made.taskId, /^job_[a-z0-9]+_\d+$/);
+  assert.match(made.taskId, /^job_[a-z0-9]+_\d+(?:-[a-z0-9-]+)?$/);
   assert.ok(made.ttlMs > 3600000 && made.pollIntervalMs === 5000 && made.createdAt && made.lastUpdatedAt);
   const now = (await t.rpc("tasks/get", { taskId: made.taskId, ...meta() })).result;
   assert.equal(now.resultType, "complete");
@@ -781,6 +781,35 @@ await test("refuses a duplicate resume and routes pre-upgrade leftovers to perso
   } finally { srv.stop(); }
 });
 
+await test("a label becomes the tail of the job id; the job answers to both forms and an unlabelled id is as before", async () => {
+  assert.equal(bridge.labelSlug("Card fixes"), "card-fixes");
+  assert.equal(bridge.labelSlug("  --Öğe düzeltme: #2!  "), "oge-duzeltme-2");
+  assert.equal(bridge.labelSlug("x".repeat(40) + " y"), "x".repeat(32));
+  assert.equal(bridge.labelSlug("a".repeat(31) + " b c"), "a".repeat(31), "no hyphen left at the cut");
+  for (const none of ["", "   ", "!!!", undefined, 7, null]) assert.equal(bridge.labelSlug(none), "");
+  const srv = new Server("label-state", { FAKE_DIR: join(root, "label-fake"), BRIDGE_JOB_HOME: join(root, "label-profile") });
+  const peer = new Server("label-state", { FAKE_DIR: join(root, "label-fake"), BRIDGE_JOB_HOME: join(root, "label-profile") });
+  try {
+    const text = (await srv.call("opencode_run", { prompt: "FAKE:hang:4000", label: "Card fixes" })).text;
+    const id = /started ([a-z0-9_-]+)/.exec(text)[1];
+    assert.match(id, /^job_[a-z0-9]+_1-card-fixes$/);
+    const bare = id.replace(/-.*/, "");
+    assert.ok(existsSync(join(root, "label-state", id + ".json")), "the state file carries the full id");
+    await until("it to run", async () => new RegExp("^" + id + " running", "m").test((await srv.call("opencode_list")).text), 30000);
+    assert.match((await srv.call("opencode_result", { job: bare, wait_seconds: 0 })).text, new RegExp("^" + id + " "), "the bare id finds it, the answer names it in full");
+    assert.match((await peer.call("opencode_result", { job: bare, wait_seconds: 0 })).text, new RegExp("^" + id + " "), "from another session too");
+    assert.match((await srv.call("opencode_cancel", { job: bare })).text, new RegExp(id));
+    assert.match((await srv.result(id)).text, /cancelled/);
+    const plain = await srv.run({ prompt: "FAKE:quick" });
+    assert.match(plain, /^job_[a-z0-9]+_2$/);
+    assert.match((await srv.result(plain)).text, /^PONG/);
+    assert.match(await srv.run({ prompt: "FAKE:quick", label: "?!" }), /^job_[a-z0-9]+_3$/, "a label with nothing usable is no label");
+  } finally {
+    srv.stop();
+    peer.stop();
+  }
+});
+
 await test("standalone runs overlap when the service cannot start; past the chain limit a newcomer waits instead of failing", async () => {
   const dir = join(root, "par-fake");
   const env = { FAKE_DIR: dir, BRIDGE_JOB_HOME: join(root, "par-profile"), FAKE_NO_SERVICE: "1" };
@@ -893,7 +922,7 @@ for (const pid of strays) {
 }
 await sleep(500);
 // Only the fakes with a registration created in this test's unique scratch root.
-for (const folder of ["workers","lean-profile","signin-profile","close-profile","resume-profile","get-profile-service","deadline-profile"]) {
+for (const folder of ["workers","lean-profile","signin-profile","close-profile","resume-profile","get-profile-service","deadline-profile","label-profile"]) {
   const file = join(root,folder,"job-service","state","opencode","service.json");
   if (!existsSync(file)) continue;
   const svc = JSON.parse(readFileSync(file,"utf8"));

@@ -202,7 +202,7 @@ function pruneFiles(now = Date.now()) {
   }
   try {
     for (const f of readdirSync(STATE_DIR)) {
-      if (!/^job_[a-z0-9]+_\d+\.(json|jsonl|cancel)$/.test(f)) continue;
+      if (!/^job_[a-z0-9]+_\d+(?:-[a-z0-9-]+)?\.(json|jsonl|cancel)$/.test(f)) continue;
       const p = join(STATE_DIR, f);
       try {
         if (now - statSync(p).mtimeMs > KEEP_DAYS * 24 * 60 * MIN) {
@@ -872,7 +872,7 @@ function previousSession(session, exclude) {
   for (const j of jobs.values()) see(j.state);
     try {
       for (const f of readdirSync(STATE_DIR)) {
-        if (!/^job_[a-z0-9]+_\d+\.json$/.test(f)) continue;
+        if (!/^job_[a-z0-9]+_\d+(?:-[a-z0-9-]+)?\.json$/.test(f)) continue;
         const raw = readFileSync(join(STATE_DIR, f), "utf8");
         if (raw.includes(JSON.stringify(session))) see(JSON.parse(raw));
       }
@@ -924,6 +924,7 @@ const COMMON_PROPS = () => ({
   },
   timeout_seconds: { type: "number", description: `Wall-clock limit for this job. Default ${TIMEOUT_MS / 1000}, max ${MAX_TIMEOUT_MS / 1000}. Raise it for jobs that run long builds or test suites.` },
   idle_seconds: { type: "number", description: `Stop the job when it prints nothing for this long and no tool call is in flight. Default ${IDLE_MS / 1000}, at most the wall-clock limit.` },
+  label: { type: "string", description: "A short name for this job, shown in the task list (a few words, e.g. \"card fixes\"). It becomes the tail of the job id: job_k3x_2-card-fixes." },
   tool_idle_seconds: { type: "number", description: `The idle limit while a tool call (a build, a test run) is in flight. Default ${TOOL_IDLE_MS / 1000}, at least idle_seconds, at most the wall-clock limit.` },
 });
 // What a caller sees: the workers, by name. No model catalog and no agent list: those are not for it to choose from.
@@ -1015,6 +1016,7 @@ const buildOpenTool = () => ({
         type: "number",
         description: `The idle limit while a tool call (a build, a test run) is in flight. Default ${TOOL_IDLE_MS / 1000}, at least idle_seconds, at most the wall-clock limit.`,
       },
+      label: { type: "string", description: "A short name for this job, shown in the task list (a few words). It becomes the tail of the job id." },
       agent: {
         type: "string",
         description:
@@ -1082,7 +1084,23 @@ const collected = new Set(); // jobs whose reply reached the caller in any way: 
 
 const statePath = (id) => join(STATE_DIR, `${id}.json`);
 const logPath = (id) => join(STATE_DIR, `${id}.jsonl`);
-const validId = (id) => typeof id === "string" && /^job_[a-z0-9]+_\d+$/.test(id);
+const validId = (id) => typeof id === "string" && /^job_[a-z0-9]+_\d+(?:-[a-z0-9-]+)?$/.test(id);
+// A job's label as the tail of its id: lowercase ASCII letters, digits and hyphens, at most 32, none at either end.
+export function labelSlug(label) {
+  if (typeof label !== "string") return "";
+  return label.normalize("NFKD").replace(/[\u0300-\u036f]/g, "").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+/, "").slice(0, 32).replace(/-+$/, "");
+}
+// A labelled job also answers to its id without the label, when exactly one job has that id.
+export function fullId(id) {
+  if (typeof id !== "string" || !/^job_[a-z0-9]+_\d+$/.test(id) || jobs.has(id) || existsSync(statePath(id))) return id;
+  const found = new Set([...jobs.keys()].filter((k) => k.startsWith(id + "-")));
+  try {
+    for (const f of readdirSync(STATE_DIR)) if (f.startsWith(id + "-") && f.endsWith(".json") && validId(f.slice(0, -5))) found.add(f.slice(0, -5));
+  } catch {
+    // no state folder: this instance's own jobs only
+  }
+  return found.size === 1 ? [...found][0] : id;
+}
 // A cancel asked from another server instance: a file the job's owner looks for once a second.
 const cancelPath = (id) => join(STATE_DIR, `${id}.cancel`);
 const cancelAsked = (id) => existsSync(cancelPath(id));
@@ -1137,7 +1155,8 @@ function prune() {
 }
 
 function startJob(args) {
-  const id = `${PREFIX}_${nextJob++}`;
+  const slug = labelSlug(args.label);
+  const id = `${PREFIX}_${nextJob++}${slug ? `-${slug}` : ""}`;
   const wall = clampMs(args.timeout_seconds, TIMEOUT_MS, MAX_TIMEOUT_MS);
   const idle = Math.min(clampMs(args.idle_seconds, IDLE_MS, MAX_TIMEOUT_MS), wall);
   const toolIdle = Math.min(Math.max(idle, clampMs(args.tool_idle_seconds, TOOL_IDLE_MS, MAX_TIMEOUT_MS)), wall);
@@ -1157,6 +1176,7 @@ function startJob(args) {
     ok: false,
     log: logPath(id),
   };
+  if (slug) state.label = args.label.trim().slice(0, 80);
   const job = { state, child: null, cancelled: false };
   if (args._w) state.worker = args._w.name; // a continued session goes back to this worker
   const ref = resolveModel(args);
@@ -1826,7 +1846,7 @@ function pendingStates() {
     // no state folder: only this instance's jobs
   }
   for (const f of names) {
-    if (!/^job_[a-z0-9]+_\d+\.json$/.test(f) || jobs.has(f.slice(0, -5))) continue;
+    if (!/^job_[a-z0-9]+_\d+(?:-[a-z0-9-]+)?\.json$/.test(f) || jobs.has(f.slice(0, -5))) continue;
     try {
       const raw = readFileSync(join(STATE_DIR, f), "utf8");
       if (!/"status":"(running|queued)"/.test(raw)) continue; // finished jobs are most of the folder
@@ -1894,7 +1914,7 @@ async function busyLines(states) {
   const owners = new Map();
   try {
     for (const f of readdirSync(STATE_DIR)) {
-      if (!/^job_[a-z0-9]+_\d+\.json$/.test(f)) continue;
+      if (!/^job_[a-z0-9]+_\d+(?:-[a-z0-9-]+)?\.json$/.test(f)) continue;
       const raw = readFileSync(join(STATE_DIR, f), "utf8");
       const ses = /"session":"([^"]+)"/.exec(raw)?.[1];
       if (!ses || !left.includes(ses)) continue;
@@ -2009,7 +2029,7 @@ const send = (msg) => process.stdout.write(JSON.stringify(msg) + "\n");
 // What this client offers, kept for opencode_list and in clients.jsonl: whether a client can take a long job as an
 // MCP task (the io.modelcontextprotocol/tasks extension) is known only from what it sends.
 const TASKS_EXT = "io.modelcontextprotocol/tasks";
-const VERSION = "3.4.0";
+const VERSION = "3.5.0";
 
 // ---- MCP tasks (OPENCODE_TASKS=1) ----
 // With protocol 2026-07-28 and the tasks extension a client takes a long job as a task: opencode_run returns at
@@ -2096,7 +2116,7 @@ async function handle(msg) {
         },
       });
     if (method === "tasks/get" || method === "tasks/cancel") {
-      const f = current(String(params?.taskId ?? ""));
+      const f = current(fullId(String(params?.taskId ?? "")));
       if (!f) return send({ jsonrpc: "2.0", id, error: { code: -32602, message: `unknown task ${params?.taskId}` } });
       if (method === "tasks/cancel") {
         if (isPending(f.state)) await cancelJob(f.state.id);
@@ -2160,7 +2180,7 @@ async function handle(msg) {
       return reply(`started ${job}${on}${waiting}, limit ${s.timeoutMs / 1000}s, idle ${s.idleMs / 1000}s. Wait for it with one call: opencode_result { job: "${job}" } (or several ids at once as \`jobs\`); it returns when the job ends. Nothing wakes you when a job ends: do not end your turn before you have its reply.`);
     }
     if (params?.name === "opencode_result") {
-      const ids = [...new Set([...(Array.isArray(a.jobs) ? a.jobs : []), ...(a.job ? [a.job] : [])].map(String))];
+      const ids = [...new Set([...(Array.isArray(a.jobs) ? a.jobs : []), ...(a.job ? [a.job] : [])].map((j) => fullId(String(j))))];
       if (!ids.length) return reply("pass `job` or `jobs`", true);
       const pending = (s) => s.status === "running" || s.status === "queued";
       const look = () => new Map(ids.map((jid) => [jid, current(jid)]));
@@ -2225,7 +2245,7 @@ ${TASK_WAIT}` : progressOne(s));
       lines.push(left ? `${left} still running. ${asTask ? TASK_WAIT : NO_NOTICE}` : "All done.");
       return reply([...parts, lines.join("\n")].join("\n\n"));
     }
-    if (params?.name === CANCEL_TOOL.name) return reply(...(await cancelJob(a.job)));
+    if (params?.name === CANCEL_TOOL.name) return reply(...(await cancelJob(fullId(a.job))));
     if (params?.name === LIST_TOOL.name) return reply(await listText());
     return send({ jsonrpc: "2.0", id, error: { code: -32602, message: `unknown tool ${params?.name}` } });
   }
