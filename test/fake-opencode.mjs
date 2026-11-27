@@ -14,6 +14,8 @@
 //   FAKE:unknown:<ms>   the same, but `session.messages` fails, so nobody can say which tool runs
 //   FAKE:daemon         a tool whose process belongs to "the service" and never ends; `session.interrupt` stops it
 //   FAKE:stubborn       the same, but the interrupt does not stop it and the session stays busy
+//   FAKE:background:<ms> the turn ends with a build left running in the background (`background_wait`), the run
+//                       waits <ms> in silence, then the build's result starts another turn, which answers and ends
 //   FAKE:drop:<n>       the service "restarts" under the run: a transport error and exit 1, for the first <n> runs
 //                       in the session; the run after those answers PONG
 import { execFileSync } from "node:child_process";
@@ -223,6 +225,18 @@ async function main() {
     await sleep(Number(arg));
     toolDone();
     return finishStep("built");
+  }
+  if (kind === "background") {
+    // as OpenCode 2.4's run does: the turn ends, the session is idle, and the run waits for the job it left
+    toolDone();
+    ev("text", { type: "text", text: "The build runs in the background; I'll go on when it reports.", time: { start: 1, end: 2 } });
+    ev("step_finish", { type: "step-finish", reason: "stop", cost: 0.001, tokens: { reasoning: 5 } });
+    rmSync(active, { force: true });
+    out({ type: "background_wait", timestamp: Date.now(), sessionID: ses, jobs: [{ id: "sh_1", kind: "shell", title: command }] });
+    await sleep(Number(arg));
+    writeFileSync(active, JSON.stringify({ scope }));
+    ev("step_start", { type: "step-start" });
+    return finishStep("built in the background");
   }
   if (kind === "daemon" || kind === "stubborn") {
     // the tool's process: started through a parent that exits at once, so it is no descendant of this `run`

@@ -82,6 +82,31 @@ await test("the timeout reason names the tool in flight and for how long", () =>
   assert.match(bridge.idleReason({ limitMs: 2700e3, flight: { unknown: true, label: "x", since: 0 } }), /open step \(OpenCode could not say which tool/);
 });
 
+await test("background work a turn left running is read from both runtimes' events and keeps its start time", () => {
+  const build = "export CARGO_TARGET_DIR=E:/t CARGO_BUILD_JOBS=2\ncargo clippy --workspace --all-targets";
+  const oc = bridge.backgroundUpdate({ type: "background_wait", jobs: [{ id: "sh_1", kind: "shell", title: build }, { id: "sh_2", kind: "shell", title: "cargo test" }] }, null, 5000);
+  assert.deepEqual(oc, { label: 'background shell "export CARGO_TARGET_DIR=E:/t CARGO_BUILD_JOBS=2 cargo clippy --workspace --all-t" and 1 more', since: 5000, background: true, count: 2 });
+  const cc = { type: "system", subtype: "background_tasks_changed", tasks: [{ task_id: "b1", task_type: "local_bash", description: "cargo build" }] };
+  assert.deepEqual(bridge.backgroundUpdate(cc, oc, 9000), { label: 'background shell "cargo build"', since: 5000, background: true, count: 1 }, "a change of the list keeps when the work began");
+  assert.equal(bridge.backgroundUpdate({ ...cc, tasks: [] }, oc), null, "an empty list: nothing left in the background");
+  assert.equal(bridge.backgroundUpdate({ type: "background_wait", jobs: [] }, oc), null);
+  assert.equal(bridge.backgroundUpdate({ type: "step_finish" }, oc), undefined, "other events change nothing");
+  assert.equal(bridge.backgroundUpdate({ type: "system", subtype: "init" }, oc), undefined);
+  assert.equal(bridge.backgroundUpdate({ type: "background_wait", jobs: "x" }, oc), undefined);
+  assert.equal(bridge.backgroundUpdate({ type: "background_wait", jobs: [{ kind: "subagent" }] }, null, 1).label, "background subagent");
+  // it counts as a flight: the longer limit applies, and the reason says what was still running
+  assert.equal(bridge.idleVerdict({ idleMs: 1200e3, toolIdleMs: 2700e3, quietMs: 1300e3, flight: oc }).expired, false);
+  assert.equal(
+    bridge.idleReason({ limitMs: 2700e3, flight: { label: 'background shell "cargo build"', since: 1000, background: true }, now: 2711e3 }),
+    'no output for 2700s while background shell "cargo build" had been running for 2710s',
+  );
+});
+
+await test("a Claude Code worker on an edit job is told how to run a long command", () => {
+  assert.match(bridge.CLAUDE_LONG_COMMANDS, /run_in_background and a timeout long enough/);
+  assert.match(bridge.CLAUDE_LONG_COMMANDS, /Do not poll it with sleep/);
+});
+
 await test("a tool is labelled with its name and the first 80 characters of its command", () => {
   assert.equal(bridge.toolLabel("shell", { command: "cargo   build\n --release" }), 'shell "cargo build --release"');
   assert.equal(bridge.toolLabel("shell", { command: "x".repeat(200) }), `shell "${"x".repeat(80)}"`);
@@ -272,6 +297,28 @@ await test("a tool call in flight keeps a silent job alive past the plain idle l
     assert.match(r.text, /^built\n/);
     assert.match(r.text, /stats: 1 tool call · total \d+s · peak idle [6-9]s · last tool shell$/);
   }
+});
+
+await test("a build the turn left running in the background keeps the job open, and its session finishes it", async () => {
+  const job = await one.run({ prompt: "FAKE:background:7000", idle_seconds: 3, tool_idle_seconds: 30 });
+  await until("the background build to show", async () => {
+    const p = await one.call("opencode_result", { job, wait_seconds: 0 });
+    return /in flight: background shell "cargo build/.test(p.text);
+  });
+  assert.match((await one.call("opencode_list")).text, new RegExp(`${job} running · .* · in flight: background shell "cargo build --release[^"]{0,60}" for \\d+s`));
+  const r = await one.result(job);
+  assert.equal(r.isError, false, r.text);
+  assert.match(r.text, /^The build runs in the background; I'll go on when it reports\.\n\nbuilt in the background\n/);
+  assert.match(r.text, /stats: 1 tool call · total \d+s · peak idle [6-9]s · last tool shell$/);
+});
+
+await test("background work that stays silent past the tool idle limit still ends the job, and the reason names it", async () => {
+  const job = await one.run({ prompt: "FAKE:background:60000", idle_seconds: 2, tool_idle_seconds: 5 });
+  const t = Date.now();
+  const r = await one.result(job);
+  assert.ok(Date.now() - t < 20000, "the tool idle limit is the cap");
+  assert.equal(r.isError, true);
+  assert.match(r.text.split("\n")[0], /^status: timeout \(no output for 5s while background shell "cargo build --release[^"]*" had been running for [5-9]s\)$/);
 });
 
 await test("the tool idle limit ends it, names the tool, interrupts the session and so stops the tool's process", async () => {
@@ -609,7 +656,7 @@ await test("with OPENCODE_TASKS a job is an MCP task: the run returns at once an
   assert.match(gone.result.content[0].text, /^status: cancelled/);
 
   // the older protocol still works on the same server
-  assert.equal((await t.start()).serverInfo.version, "3.5.0");
+  assert.equal((await t.start()).serverInfo.version, "3.6.0");
   t.stop();
 });
 

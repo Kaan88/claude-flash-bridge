@@ -118,6 +118,14 @@ const workers = () => (CLAUDE_EXE ? Object.fromEntries(Object.entries(workerSet(
 // `_w` is the worker a call was resolved to; without it (OPENCODE_ALLOW_ANY) the arguments say what runs.
 const isClaudeJob = (a) =>
   a._w ? a._w.runs === "claude" : String(a.model || "").startsWith(`${CLAUDE_PROVIDER}/`) || CLAUDE_SESSION.test(String(a.session || "")) || !!(a.agent && workers()[a.agent]);
+// Told to a Claude Code worker on an edit job. Its Bash tool stops a foreground call after 10 minutes and moves it to
+// the background, where it is stopped again later (a cold build was lost that way twice in one job, 2026-11-27); a
+// command started in the background with its own timeout runs on, and this job stays open while it runs.
+export const CLAUDE_LONG_COMMANDS =
+  "You run as a headless background job: nobody reads your messages until you give your final report. " +
+  "Start a command that may take longer than 10 minutes (a cold build, a full test suite) with run_in_background and a timeout long enough for it, not in the foreground. " +
+  "While it runs, go on with other work or end your turn: the job stays open, and you are told when the command ends. " +
+  "Do not poll it with sleep or start a second copy. Give the final report only when the work is done.";
 // What a read-only Claude job may do: read, search, look things up, and run read-only git commands.
 const CLAUDE_READ_TOOLS = ["Read", "Grep", "Glob", "WebFetch", "WebSearch", "Bash(git status*)", "Bash(git diff*)", "Bash(git log*)", "Bash(git show*)"];
 // Which Claude account a Claude Code worker runs on, for someone with several (workers.json: "claudeAccounts", the
@@ -177,7 +185,8 @@ const MIN = 60 * 1000;
 // A full build or test run inside one tool call can be silent for many minutes, so the idle limit is generous.
 const TIMEOUT_MS = Number(process.env.OPENCODE_TIMEOUT_MS || 60 * MIN);
 const IDLE_MS = Number(process.env.OPENCODE_IDLE_MS || 20 * MIN);
-// While a tool call is in flight (a shell running a build) silence is expected, so a longer idle limit applies.
+// While a tool call is in flight (a shell running a build), or a background command the worker started is still
+// running after its turn ended, silence is expected, so a longer idle limit applies.
 const TOOL_IDLE_MS = Number(process.env.OPENCODE_TOOL_IDLE_SECONDS || 45 * 60) * 1000;
 // OpenCode's event stream reports a tool call only when it ends: a silent job is asked this often what it is doing.
 const PROBE_MS = Math.max(250, Number(process.env.OPENCODE_PROBE_MS || 30000));
@@ -912,7 +921,7 @@ function useWorker(a) {
 const TOOL_TAIL = () =>
   "A new session starts with NO context: put everything it needs in `prompt` (paths, goal, constraints, output format). Pass `session` to continue an earlier one instead. " +
   "Without `allow_edits` the job is read-only (enforced, not just asked): it can read, search and run read-only commands. " +
-  `At most ${MAX_CONCURRENT} jobs run at once on this machine and ${LOCAL_CONCURRENT} per local model; more queue (\`opencode_list\` shows them). A job stops after \`timeout_seconds\` (default ${TIMEOUT_MS / 1000}), or \`idle_seconds\` without output (default ${IDLE_MS / 1000}; ${TOOL_IDLE_MS / 1000} while a tool call such as a build is in flight).`;
+  `At most ${MAX_CONCURRENT} jobs run at once on this machine and ${LOCAL_CONCURRENT} per local model; more queue (\`opencode_list\` shows them). A job stops after \`timeout_seconds\` (default ${TIMEOUT_MS / 1000}), or \`idle_seconds\` without output (default ${IDLE_MS / 1000}; ${TOOL_IDLE_MS / 1000} while a tool call such as a build is in flight, or a background command the worker started is still running). A worker may move a long build to the background and end its turn: the job stays open while that command runs, and its session goes on by itself when the command ends. Give a job whose builds can be silent for longer than that a larger \`tool_idle_seconds\` and \`timeout_seconds\`.`;
 const COMMON_PROPS = () => ({
   prompt: { type: "string", description: "Full, self-contained task description." },
   directory: { type: "string", description: "Working directory for the worker (absolute path). Defaults to this server's cwd." },
@@ -923,9 +932,9 @@ const COMMON_PROPS = () => ({
     description: "Session id returned by an earlier call (the `session:` line). Continues that conversation with all its context: send only the follow-up (review findings, next step), not the whole spec again.",
   },
   timeout_seconds: { type: "number", description: `Wall-clock limit for this job. Default ${TIMEOUT_MS / 1000}, max ${MAX_TIMEOUT_MS / 1000}. Raise it for jobs that run long builds or test suites.` },
-  idle_seconds: { type: "number", description: `Stop the job when it prints nothing for this long and no tool call is in flight. Default ${IDLE_MS / 1000}, at most the wall-clock limit.` },
+  idle_seconds: { type: "number", description: `Stop the job when it prints nothing for this long while no tool call is in flight and no background command it started is running. Default ${IDLE_MS / 1000}, at most the wall-clock limit.` },
   label: { type: "string", description: "A short name for this job, shown in the task list (a few words, e.g. \"card fixes\"). It becomes the tail of the job id: job_k3x_2-card-fixes." },
-  tool_idle_seconds: { type: "number", description: `The idle limit while a tool call (a build, a test run) is in flight. Default ${TOOL_IDLE_MS / 1000}, at least idle_seconds, at most the wall-clock limit.` },
+  tool_idle_seconds: { type: "number", description: `The idle limit while a tool call (a build, a test run) is in flight, or a background command the worker started is still running. Default ${TOOL_IDLE_MS / 1000}, at least idle_seconds, at most the wall-clock limit.` },
 });
 // What a caller sees: the workers, by name. No model catalog and no agent list: those are not for it to choose from.
 const buildWorkerTool = () => {
@@ -969,7 +978,7 @@ const buildOpenTool = () => ({
     "your Claude plan, Claude Code's tools and CLAUDE.md, no MCP servers). " +
     "A new session starts with NO context: put everything it needs in `prompt` (paths, goal, constraints, output format). Pass `session` to continue an earlier one instead. " +
     "Without `allow_edits` the job is read-only (enforced, not just asked): it can read, search and run read-only commands. " +
-    `At most ${MAX_CONCURRENT} jobs run at once on this machine and ${LOCAL_CONCURRENT} per local model; more queue (\`opencode_list\` shows them). A job stops after \`timeout_seconds\` (default ${TIMEOUT_MS / 1000}), or \`idle_seconds\` without output (default ${IDLE_MS / 1000}; ${TOOL_IDLE_MS / 1000} while a tool call such as a build is in flight).`,
+    `At most ${MAX_CONCURRENT} jobs run at once on this machine and ${LOCAL_CONCURRENT} per local model; more queue (\`opencode_list\` shows them). A job stops after \`timeout_seconds\` (default ${TIMEOUT_MS / 1000}), or \`idle_seconds\` without output (default ${IDLE_MS / 1000}; ${TOOL_IDLE_MS / 1000} while a tool call such as a build is in flight, or a background command the worker started is still running). A worker may move a long build to the background and end its turn: the job stays open while that command runs, and its session goes on by itself when the command ends. Give a job whose builds can be silent for longer than that a larger \`tool_idle_seconds\` and \`timeout_seconds\`.`,
   inputSchema: {
     type: "object",
     properties: {
@@ -1010,11 +1019,11 @@ const buildOpenTool = () => ({
       },
       idle_seconds: {
         type: "number",
-        description: `Stop the job when it prints nothing for this long and no tool call is in flight. Default ${IDLE_MS / 1000}, at most the wall-clock limit.`,
+        description: `Stop the job when it prints nothing for this long while no tool call is in flight and no background command it started is running. Default ${IDLE_MS / 1000}, at most the wall-clock limit.`,
       },
       tool_idle_seconds: {
         type: "number",
-        description: `The idle limit while a tool call (a build, a test run) is in flight. Default ${TOOL_IDLE_MS / 1000}, at least idle_seconds, at most the wall-clock limit.`,
+        description: `The idle limit while a tool call (a build, a test run) is in flight, or a background command the worker started is still running. Default ${TOOL_IDLE_MS / 1000}, at least idle_seconds, at most the wall-clock limit.`,
       },
       label: { type: "string", description: "A short name for this job, shown in the task list (a few words). It becomes the tail of the job id." },
       agent: {
@@ -1243,7 +1252,35 @@ export function idleReason({ limitMs, flight, now = Date.now() }) {
   const base = `no output for ${Math.round(limitMs / 1000)}s`;
   if (!flight) return `${base}, no tool call in flight`;
   if (flight.unknown) return `${base} inside an open step (OpenCode could not say which tool was running)`;
-  return `${base} while tool ${flight.label} was in flight for ${Math.round((now - flight.since) / 1000)}s`;
+  return `${base} while ${flightPhrase(flight, now)}`;
+}
+export function flightPhrase(flight, now = Date.now()) {
+  const t = Math.round((now - flight.since) / 1000);
+  return flight.background ? `${flight.label} had been running for ${t}s` : `tool ${flight.label} was in flight for ${t}s`;
+}
+
+// Background work the worker started and its runtime is waiting for, read from the job's own event stream, so it
+// counts as activity (the longer idle limit applies) instead of the job being ended as silent:
+// - OpenCode's `run` ends a turn with `background_wait` {jobs: [{id, kind, title}]} and then waits; when a job ends,
+//   its result reaches the session, which runs again. The event comes again only when the count changes, and the
+//   run exits once none are left, so the last list holds until the run ends.
+// - Claude Code (`-p`) sends `background_tasks_changed` {tasks: [{task_id, task_type, description}]} on every change
+//   and stays up after its result while a task runs; the task's notification starts its next turn.
+// Returns undefined for any other event, null when nothing runs in the background, else a flight that keeps the
+// time the background work began. The tool idle limit and the wall-clock limit still end a job whose background
+// command hangs.
+export function backgroundUpdate(ev, prev, now = Date.now()) {
+  let list;
+  if (ev?.type === "background_wait" && Array.isArray(ev.jobs)) list = ev.jobs;
+  else if (ev?.type === "system" && ev.subtype === "background_tasks_changed" && Array.isArray(ev.tasks)) list = ev.tasks;
+  else return undefined;
+  const jobs = list.filter((j) => j && typeof j === "object");
+  if (!jobs.length) return null;
+  const j = jobs[0];
+  const kind = String(j.kind || (j.task_type === "local_bash" ? "shell" : j.task_type) || "job");
+  const what = typeof j.title === "string" ? j.title : typeof j.description === "string" ? j.description : "";
+  const more = jobs.length > 1 ? ` and ${jobs.length - 1} more` : "";
+  return { label: `background ${toolLabel(kind, { command: what })}${more}`, since: prev?.since ?? now, background: true, count: jobs.length };
 }
 
 // Searches the newest messages of an OpenCode session (`session.messages`) for a tool call that is running:
@@ -1373,6 +1410,8 @@ function absorb(job, acc, ev) {
   // a step is the model's turn plus the tool calls it made: between its start and its finish a tool may be running
   if (ev.type === "step_start") acc.stepOpen = true;
   if (ev.type === "step_finish") acc.stepOpen = false;
+  const bg = backgroundUpdate(ev, acc.background);
+  if (bg !== undefined) acc.background = bg;
   const tool = part.tool || (ev.type === "tool_use" ? ev.tool : "");
   if (tool) {
     s.lastTool = tool;
@@ -1449,6 +1488,8 @@ function absorbClaude(job, acc, ev) {
   // a tool call ends with its result, which comes back as a user message
   if (ev.type === "user" && Array.isArray(ev.message?.content)) for (const c of ev.message.content) if (c.type === "tool_result") acc.flights.delete(c.tool_use_id);
   if (ev.type === "result") acc.flights.clear();
+  const bg = backgroundUpdate(ev, acc.background);
+  if (bg !== undefined) acc.background = bg;
   if (ev.type === "system" && ev.subtype === "api_retry") s.retry = `attempt ${ev.attempt}: ${String(ev.error || "").slice(0, 160)}`;
   else if (ev.type === "assistant") s.retry = "";
   if (ev.type === "result") {
@@ -1530,7 +1571,8 @@ function runClient(job, { prompt, directory, files = [], allow_edits = false, ag
       if (model) args.push("--model", String(model).slice(CLAUDE_PROVIDER.length + 1));
       if (effort) args.push("--effort", effort);
       if (session) args.push("--resume", session);
-      if (worker?.instructions) args.push("--append-system-prompt", worker.instructions);
+      const note = [allow_edits ? CLAUDE_LONG_COMMANDS : "", worker?.instructions || ""].filter(Boolean).join("\n\n");
+      if (note) args.push("--append-system-prompt", note);
       if (!allow_edits) args.push("--allowedTools", ...CLAUDE_READ_TOOLS); // variadic: keep it last
       if (files.length) prompt = `${prompt}\n\nFiles to read first:\n${files.join("\n")}`;
     } else {
@@ -1559,7 +1601,7 @@ function runClient(job, { prompt, directory, files = [], allow_edits = false, ag
     const stdinFor = (text) => (allow_edits ? text : `READ-ONLY TASK: do not create, modify or delete any files and do not run state-changing commands.\n\n${text}`);
     const take = claude ? absorbClaude : absorb;
 
-    const acc = { texts: [], errors: [], cost: 0, reasoning: 0, stderr: "", tools: 0, peakIdle: 0, stepOpen: false, flights: new Map() };
+    const acc = { texts: [], errors: [], cost: 0, reasoning: 0, stderr: "", tools: 0, peakIdle: 0, stepOpen: false, flights: new Map(), background: null };
     const log = createWriteStream(s.log);
     let child;
     const cwd = directory && existsSync(directory) ? directory : process.cwd();
@@ -1638,7 +1680,7 @@ function runClient(job, { prompt, directory, files = [], allow_edits = false, ag
 
     const wallTimer = setTimeout(() => {
       const flight = flightNow();
-      end("timeout", `wall-clock limit ${s.timeoutMs / 1000}s${flight && !flight.unknown ? `; tool ${flight.label} was in flight for ${secs(Date.now() - flight.since)}` : ""}`);
+      end("timeout", `wall-clock limit ${s.timeoutMs / 1000}s${flight && !flight.unknown ? `; ${flightPhrase(flight)}` : ""}`);
     }, s.timeoutMs);
 
     // What is in flight now: a tool call the event stream showed starting (Claude Code), else what OpenCode's
@@ -1662,7 +1704,8 @@ function runClient(job, { prompt, directory, files = [], allow_edits = false, ag
           probe.answered = asked;
         });
     };
-    const flightNow = () => acc.flights.values().next().value || probe.flight || null;
+    // A tool call of the current turn is named first; background work an earlier turn left running comes after it.
+    const flightNow = () => acc.flights.values().next().value || probe.flight || acc.background || null;
     const mark = () => {
       const now = Date.now();
       acc.peakIdle = Math.max(acc.peakIdle, now - s.lastEvent);
@@ -1700,6 +1743,7 @@ function runClient(job, { prompt, directory, files = [], allow_edits = false, ag
       acc.errors.length = 0;
       acc.texts.length = 0;
       acc.flights.clear();
+      acc.background = null;
       acc.stepOpen = false;
       acc.final = undefined;
       mark();
@@ -2029,7 +2073,7 @@ const send = (msg) => process.stdout.write(JSON.stringify(msg) + "\n");
 // What this client offers, kept for opencode_list and in clients.jsonl: whether a client can take a long job as an
 // MCP task (the io.modelcontextprotocol/tasks extension) is known only from what it sends.
 const TASKS_EXT = "io.modelcontextprotocol/tasks";
-const VERSION = "3.5.0";
+const VERSION = "3.6.0";
 
 // ---- MCP tasks (OPENCODE_TASKS=1) ----
 // With protocol 2026-07-28 and the tasks extension a client takes a long job as a task: opencode_run returns at
