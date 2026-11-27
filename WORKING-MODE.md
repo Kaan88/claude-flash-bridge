@@ -48,7 +48,9 @@ still running, call it again right away, with no status message in between. Neve
 a background shell loop or a subagent, and don't end the turn while you still need a reply.
 
 Don't redo or re-send a job that is still running, and don't start a second job on the same files while one may still
-be editing them. A job that runs long builds or test suites gets a larger `timeout_seconds`;
+be editing them. A job that runs long builds or test suites gets a larger `timeout_seconds`, and a larger
+`tool_idle_seconds` when one build can stay silent for over 45 minutes. A worker may move a build to the background
+and end its turn: the job stays open while the build runs and its session goes on when it ends, so leave it running;
 `opencode_cancel { job }` stops one that went wrong. A timed-out, cancelled or lost job returns a short summary
 (session, files edited, last text, log path): review whatever it left in `git diff`, or continue its session.
 

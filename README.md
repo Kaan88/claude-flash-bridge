@@ -218,6 +218,21 @@ desktop app if both are installed: two versions take the service from each other
 The bridge asks the selected service directly which sessions are busy, what tool is running and to interrupt one.
 In personal-service mode it retains the older `opencode api` fallback.
 
+### Idle limits and background commands
+
+A job is ended as silent after `idle_seconds` (20 minutes) without output, or after `tool_idle_seconds` (45 minutes)
+while something it started is still running: a tool call in flight, or, since **3.6.0**, a command the worker moved
+to the background before ending its turn. Both runtimes keep such a job going by themselves: OpenCode's `run` ends the
+turn with a `background_wait` event and waits, and Claude Code (`claude -p`) reports its tasks in
+`background_tasks_changed` and stays up after its result. When the command ends, its result starts the session's
+next turn, which finishes the task. The bridge reads those two events, so the job is not killed while the build
+runs; `opencode_result` and `opencode_list` show it as `in flight: background shell "…"`. Before 3.6.0 such jobs
+were ended after 20 minutes with "no tool call in flight", although their runtime was still waiting for the build.
+
+The bridge does not continue a session itself: the runtime already does it, and a second prompt would race with
+it. A background command that hangs still ends the job at the tool idle limit, and the wall-clock limit applies as
+before. Give a job whose builds can stay silent for longer a larger `tool_idle_seconds` and `timeout_seconds`.
+
 ## Claude Code workers
 
 A worker with `runs: "claude"` runs Claude Code's own CLI (`claude -p`) through the same jobs: `opencode_result`,
@@ -227,6 +242,9 @@ A worker with `runs: "claude"` runs Claude Code's own CLI (`claude -p`) through 
   (`--strict-mcp-config`), so a worker can't start this bridge again.
 - Read-only jobs run in "don't ask" mode, allowed only to read, search, fetch web pages and run git status/diff/log/show;
   anything else is denied. Edit jobs run in Claude's `auto` permission mode, where Claude's own safety check approves actions.
+- On an edit job the worker is told (appended to its system prompt, before the worker's own `instructions`) to start a
+  command that may take over 10 minutes with `run_in_background` and a long enough timeout: Claude Code moves a
+  foreground call to the background after 10 minutes and stops it there later, which lost cold builds.
 - The calling session's `CLAUDE_*` environment variables are not passed on, so the worker is a separate session.
 - Set `OPENCODE_CLAUDE=0` to switch these workers off, or `CLAUDE_EXE` when `claude` isn't found.
 
@@ -290,8 +308,8 @@ Each session runs its own copy of the server. After changing `server.mjs`: in a 
 | `OPENCODE_READONLY_AGENT` | `<agent>-ro` | agent for read-only jobs |
 | `OPENCODE_MODEL` | `deepseek/deepseek-flash` | model used for the `effort` variants |
 | `OPENCODE_TIMEOUT_MS` | 60 min | default wall-clock limit per job; normally left unset (pass `timeout_seconds` per job instead, max 4 h) |
-| `OPENCODE_IDLE_MS` | 20 min | default limit without any output while no tool call is in flight (`idle_seconds` overrides) |
-| `OPENCODE_TOOL_IDLE_SECONDS` | 2700 (45 min) | default limit without any output while a tool call is in flight (`tool_idle_seconds` overrides) |
+| `OPENCODE_IDLE_MS` | 20 min | default limit without any output while no tool call is in flight and no background command runs (`idle_seconds` overrides) |
+| `OPENCODE_TOOL_IDLE_SECONDS` | 2700 (45 min) | default limit without any output while a tool call is in flight or a background command the worker started still runs (`tool_idle_seconds` overrides) |
 | `OPENCODE_PROBE_MS` | 30000 | how often a silent OpenCode job is asked which tool call is running |
 | `OPENCODE_MAX_CONCURRENT` | 10 | jobs running at once on this machine, all sessions together |
 | `OPENCODE_LOCAL_CONCURRENT` | 6 | jobs running at once on one local model |
