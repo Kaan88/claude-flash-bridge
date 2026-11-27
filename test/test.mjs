@@ -781,6 +781,109 @@ await test("refuses a duplicate resume and routes pre-upgrade leftovers to perso
   } finally { srv.stop(); }
 });
 
+await test("standalone runs overlap when the service cannot start; past the chain limit a newcomer waits instead of failing", async () => {
+  const dir = join(root, "par-fake");
+  const env = { FAKE_DIR: dir, BRIDGE_JOB_HOME: join(root, "par-profile"), FAKE_NO_SERVICE: "1" };
+  const runs = () => (existsSync(join(dir, "run.log")) ? readFileSync(join(dir, "run.log"), "utf8").trim().split("\n").length : 0);
+  const srv = new Server("par-state", env);
+  try {
+    const a = await srv.run({ prompt: "FAKE:hang:6000" });
+    await until("the first standalone run", () => runs() === 1, 30000);
+    const b = await srv.run({ prompt: "FAKE:hang:2000" });
+    await until("both runs at once", () => readdirSync(join(dir, "active")).length === 2, 30000);
+    const second = await srv.result(b);
+    assert.match(second.text, /^woke up/);
+    assert.match(second.text, /worker service: Worker service is unavailable while standalone workers run; using standalone for this job\.$/);
+    assert.match((await srv.result(a)).text, /^woke up/);
+  } finally {
+    srv.stop();
+  }
+  const late = new Server("par-late", { ...env, BRIDGE_STANDALONE_CHAIN_MS: "1" });
+  try {
+    const a = await late.run({ prompt: "FAKE:hang:5000" });
+    await until("its run", () => runs() === 3, 30000);
+    const b = await late.run({ prompt: "FAKE:quick" });
+    await until("the wait to be noted", () => {
+      try {
+        return /^Waiting for standalone workers to finish/.test(JSON.parse(readFileSync(join(root, "par-late", b + ".json"), "utf8")).profileNote);
+      } catch {
+        return false;
+      }
+    }, 30000);
+    assert.equal(runs(), 3, "the newcomer has not started");
+    const c = await late.run({ prompt: "FAKE:quick" });
+    await sleep(1500);
+    assert.match((await late.call("opencode_cancel", { job: c })).text, /cancel/i);
+    assert.match((await late.result(c)).text, /cancelled/, "a waiting job can be cancelled");
+    assert.match((await late.result(b)).text, /^PONG/);
+    assert.match((await late.result(a)).text, /^woke up/);
+  } finally {
+    late.stop();
+  }
+});
+
+await test("a session no job here remembers is looked up in the database before it is continued, standalone too", async () => {
+  const dir = join(root, "get-fake");
+  const env = { FAKE_DIR: dir, BRIDGE_JOB_HOME: join(root, "get-profile"), FAKE_NO_SERVICE: "1" };
+  const first = new Server("get-one", env);
+  const ses = fakeSession((await first.result(await first.run({ prompt: "FAKE:quick" }))).text);
+  first.stop();
+  const next = new Server("get-two", env); // another machine state: nothing remembers the session
+  try {
+    assert.match((await next.result(await next.run({ prompt: "FAKE:quick", session: ses }))).text, new RegExp("^PONG\\n\\n---\\nsession: " + ses));
+    assert.match(readFileSync(join(dir, "api.log"), "utf8"), new RegExp("session\\.get " + ses));
+    assert.match((await next.result(await next.run({ prompt: "FAKE:quick", session: "ses_fake1" }))).text, /Could not verify this session/);
+  } finally {
+    next.stop();
+  }
+  const dir2 = join(root, "get-fake-service");
+  const shared = { FAKE_DIR: dir2, BRIDGE_JOB_HOME: join(root, "get-profile-service") };
+  const one = new Server("get-three", shared);
+  const ses2 = fakeSession((await one.result(await one.run({ prompt: "FAKE:quick" }))).text);
+  one.stop();
+  const two = new Server("get-four", shared);
+  try {
+    assert.match((await two.result(await two.run({ prompt: "FAKE:quick", session: ses2 }))).text, /^PONG/);
+    assert.match((await two.result(await two.run({ prompt: "FAKE:quick", session: "ses_fake1" }))).text, /Could not verify this session/);
+  } finally {
+    two.stop();
+  }
+});
+
+await test("closing does not wait for an interrupt that hangs: the session stays on its lease", async () => {
+  const dir = join(root, "deadline-fake"), home = join(root, "deadline-profile");
+  const srv = new Server("deadline-state", { FAKE_DIR: dir, BRIDGE_JOB_HOME: home, OPENCODE_SHUTDOWN_MS: "1500" });
+  try {
+    const id = await srv.run({ prompt: "FAKE:hang:60000" });
+    await until("its session", () => {
+      try {
+        return JSON.parse(readFileSync(join(root, "deadline-state", id + ".json"))).session;
+      } catch {
+        return false;
+      }
+    });
+    writeFileSync(join(dir, "interrupt-hangs"), "");
+    const exit = new Promise((ok) => srv.child.once("exit", ok));
+    const t = Date.now();
+    srv.stop();
+    await Promise.race([exit, sleep(7000)]);
+    assert.equal(srv.child.exitCode, 0);
+    assert.ok(Date.now() - t < 5000, "left after " + (Date.now() - t) + " ms");
+    const left = readdirSync(join(home, "job-service", "clients")).filter((f) => !f.endsWith(".tmp")).map((f) => JSON.parse(readFileSync(join(home, "job-service", "clients", f), "utf8")));
+    assert.ok(left.length === 1 && left[0].pid === null && /^ses_fake/.test(left[0].session), JSON.stringify(left));
+  } finally {
+    rmSync(join(dir, "interrupt-hangs"), { force: true });
+    if (srv.child.exitCode === null) srv.child.kill();
+  }
+});
+
+await test("the coordination regressions (test/coordination.mjs)", async () => {
+  const env = { ...process.env };
+  for (const k of ["OPENCODE_BRIDGE_NO_MAIN", "OPENCODE_STATE_DIR", "OPENCODE_CLAUDE", "BRIDGE_JOB_HOME"]) delete env[k];
+  const { stdout } = await promisify(execFile)(process.execPath, [join(here, "coordination.mjs")], { env, timeout: 240000 });
+  assert.match(stdout, /coordination regression tests passed/);
+});
+
 for (const pid of strays) {
   try {
     process.kill(pid);
@@ -790,7 +893,7 @@ for (const pid of strays) {
 }
 await sleep(500);
 // Only the fakes with a registration created in this test's unique scratch root.
-for (const folder of ["workers","lean-profile","signin-profile","close-profile","resume-profile"]) {
+for (const folder of ["workers","lean-profile","signin-profile","close-profile","resume-profile","get-profile-service","deadline-profile"]) {
   const file = join(root,folder,"job-service","state","opencode","service.json");
   if (!existsSync(file)) continue;
   const svc = JSON.parse(readFileSync(file,"utf8"));

@@ -31,7 +31,7 @@ if (/^opencode(\.exe)?$/i.test(basename(process.execPath))) {
 async function main() {
   const dir = process.env.FAKE_DIR;
   const [cmd, ...rest] = [basename(process.argv[1] || ""), ...process.argv.slice(2)];
-  for (const d of ["active", "tool", "drop"]) mkdirSync(join(dir, d), { recursive: true });
+  for (const d of ["active", "tool", "drop", "known"]) mkdirSync(join(dir, d), { recursive: true });
   const out = (o) => process.stdout.write(JSON.stringify(o) + "\n");
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   const readJson = (p) => JSON.parse(readFileSync(p, "utf8"));
@@ -58,11 +58,20 @@ async function main() {
       return out({ data: [{ id: "deepseek-flash", mode: "primary", description: "Fake agent.", model: { providerID: "fake", id: "model" }, permissions: [{ action: "edit", resource: "*", effect: "ask" }, { action: "shell", resource: "*", effect: "ask" }] }] });
     if (op === "model.default") return out({ data: { providerID: "fake", id: "model" } });
     if (op === "session.active") return out({ data: Object.fromEntries(readdirSync(join(dir, "active")).filter(s => belongs(join(dir,"active",s))).map((s) => [s, { type: "running" }])) });
+    if (op === "session.get") {
+      // as v2.4.1: {data:{id,...}}, or an error and exit 1 for a session this database does not hold
+      let known = false;
+      try { known = readJson(join(dir, "known", ses)).db === (db || ""); } catch { /* never ran here */ }
+      if (!known) throw Error("Session not found");
+      return out({ data: { id: ses } });
+    }
     if (op === "session.interrupt") {
       const file = join(dir, "active", ses);
       if (!belongs(file)) return out({ interrupted: false });
       const info = readJson(file);
       if (info.stubborn) return out({ interrupted: false });
+      // accepted now, idle a moment later
+      if (info.slow) { setTimeout(() => rmSync(file, { force: true }), info.slow); return out({ interrupted: true }); }
       try {
         if (info.pid) process.kill(info.pid);
       } catch {
@@ -96,6 +105,7 @@ async function main() {
       try {
         if (path === "/api/info") {
           if (existsSync(join(dir,"slow-probe"))) await sleep(1900);
+          if (existsSync(join(dir,"hung"))) return; // alive, listening, and never answering
           return send({pid:process.pid});
         }
         if (path === "/api/plugin") return send({data:[{id:"fake"}]});
@@ -124,6 +134,9 @@ async function main() {
           writeFileSync(history,JSON.stringify(readJson(history).filter(s => s.id !== path.split("/").at(-1))));
           res.writeHead(204).end(); return;
         }
+        const one = path.match(/^\/api\/session\/(ses_fake\d+)$/);
+        if (one && req.method === "GET") return operation("session.get", {sessionID:one[1]}, send);
+        if (existsSync(join(dir,"interrupt-hangs")) && path.endsWith("/interrupt")) return;
         const match = path.match(/^\/api\/session\/(ses_fake\d+)\/(interrupt|message)$/);
         if (match) return operation(match[2] === "interrupt" ? "session.interrupt" : "session.message.list", {sessionID:match[1]}, send);
         res.writeHead(404).end();
@@ -132,7 +145,7 @@ async function main() {
     await new Promise(r => http.listen(Number(rest[rest.indexOf("--port")+1]), "127.0.0.1", r));
     mkdirSync(dirname(regFile), {recursive:true});
     writeFileSync(regFile, JSON.stringify({url:`http://127.0.0.1:${http.address().port}`, pid:process.pid, password}));
-    appendFileSync(join(dir, "services.log"), `${JSON.stringify({db,pid:process.pid})}\n`);
+    appendFileSync(join(dir, "services.log"), `${JSON.stringify({db,pid:process.pid,mark:process.env.FAKE_MARK})}\n`);
     await new Promise(() => {});
   }
   if (cmd === "service" && rest[0] === "stop") {
@@ -184,6 +197,7 @@ async function main() {
 
   const dropFile = join(dir, "drop", ses);
   if (kind === "drop" || kind === "busy") writeFileSync(dropFile, arg);
+  writeFileSync(join(dir, "known", ses), JSON.stringify({ db: db || "" }));
   if (!existsSync(active)) writeFileSync(active, JSON.stringify({scope})); // a session an earlier run left busy stays as it is
   ev("step_start", { type: "step-start" });
   const drops = existsSync(dropFile) ? Number(readFileSync(dropFile, "utf8")) : 0;

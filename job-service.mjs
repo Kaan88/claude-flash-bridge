@@ -11,7 +11,7 @@ import { basename, delimiter, dirname, isAbsolute, join, relative, resolve, sep 
 import { promisify } from "node:util";
 import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
-import { birth, independentNode, legacyWorker, matches, ownsPort } from "./process-identity.mjs";
+import { birth, independentNode, legacyBridge, legacyWorker, matches, memo, ownsPort } from "./process-identity.mjs";
 
 export function findOpencode() {
   if (process.env.OPENCODE_EXE) return process.env.OPENCODE_EXE;
@@ -42,10 +42,21 @@ const json = file => JSON.parse(readFileSync(file, "utf8"));
 const optional = file => {
   try { return json(file); } catch (e) { if (e.code === "ENOENT") return null; throw Error(`Invalid worker profile file: ${basename(file)}`); }
 };
-const atomic = (file, value) => {
+const pause = ms => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+// Windows refuses to replace a file for the instant another process has it open to read.
+function replace(tmp, file) {
+  for (let n = 0;; n++) {
+    try { return renameSync(tmp, file); }
+    catch (e) {
+      if (!["EPERM","EACCES","EBUSY"].includes(e.code) || n >= 80) { rmSync(tmp, { force: true }); throw e; }
+      pause(Math.min(2 + n, 25));
+    }
+  }
+}
+export const atomic = (file, value) => {
   const tmp = `${file}.${randomUUID()}.tmp`;
   writeFileSync(tmp, JSON.stringify(value) + "\n", { mode: 0o600 });
-  renameSync(tmp, file);
+  replace(tmp, file);
 };
 const magic = "@cortexkit/opencode-magic-context";
 export function withoutMagic(config) {
@@ -138,7 +149,7 @@ function install(snap, previous) {
     if (!inside(canonical(dst), canonical(dirname(file)))) throw Error("Unexpected link in the generated worker config.");
     mkdirSync(dirname(file), { recursive: true, mode: 0o700 });
     const tmp = `${file}.${randomUUID()}.tmp`;
-    writeFileSync(tmp, bytes, { mode: 0o600 }); renameSync(tmp, file);
+    writeFileSync(tmp, bytes, { mode: 0o600 }); replace(tmp, file);
   }
 }
 export function environment(svc, cwd, loadKeys=!svc) {
@@ -218,8 +229,7 @@ async function locked(action) {
     return await action();
   } finally { rmSync(file,{force:true}); }
 }
-let ownBirth;
-const selfBirth = () => ownBirth ||= birth(process.pid);
+const selfBirth = memo(() => birth(process.pid));
 async function healthy(svc, timeout=1500) {
   try { return (await api(svc, "/api/info", { timeout })).pid === svc.pid; } catch { return false; }
 }
@@ -241,8 +251,15 @@ async function readers(svc) {
   for (const f of readdirSync(leases)) {
     if (f.endsWith(".tmp")) continue;
     const file = join(leases,f);
-    let rec;
-    try { rec = optional(file); } catch { /* legacy empty lease */ }
+    let rec, text;
+    // A lease that cannot be read this instant is its owner's to keep: never delete on a failed read.
+    try { text = readFileSync(file,"utf8"); } catch { continue; }
+    try { rec = JSON.parse(text); } catch { /* not one of this version's */ }
+    // 3.4.0 wrote empty leases and knows nothing of this coordinator: it would stop, replace or
+    // bypass the supervised service. Its lease cannot be honoured, so do not run beside it.
+    const pid = Number(f.split("-")[0]);
+    if (!text.trim() && await legacyBridge(pid))
+      throw Error(`An older bridge (3.4.0, process ${pid}) is still using the worker profile. Close or restart the Claude session that runs it, then retry.`);
     if (await matches(rec) || (f.endsWith("-private") && await matches(rec?.child))) {
       clients.push(f); if (rec.session) held.add(rec.session); continue;
     }
@@ -260,8 +277,9 @@ async function readers(svc) {
       }
       if (session && Object.hasOwn(active,session)) {
         await interrupt(svc,session);
-        if (Object.hasOwn((await api(svc,"/api/session/active")).data,session))
-          throw Error("Worker service is blocked by a previous session still stopping.");
+        // An interrupt is accepted at once and takes effect a moment later.
+        for (const end=Date.now()+5000; Object.hasOwn((await api(svc,"/api/session/active")).data,session); await delay(150))
+          if (Date.now()>end) throw Error("Worker service is blocked by a previous session still stopping.");
       } else if (await matches(rec.child)) continue;
     }
     rmSync(file,{force:true});
@@ -269,53 +287,96 @@ async function readers(svc) {
   return clients;
 }
 export const interrupt = (svc,id) => api(svc,`/api/session/${encodeURIComponent(id)}/interrupt`,{method:"POST"});
-async function stopIdle(svc) {
+// `gen` is the manifest as just read under admission. While `stopping` is recent nobody is given
+// the service; once the process is gone its identity is forgotten, so that a later process with
+// the same PID can never be taken for it.
+async function stopIdle(svc, gen) {
   if (Object.keys((await api(svc,"/api/session/active")).data).length) return false;
+  gen.stopping=Date.now(); atomic(manifest,gen);
   await promisify(execFile)(exe,["service","stop"],{cwd:root,env:environment(null,root,false),timeout:12000,windowsHide:true});
   for (const end=Date.now()+3000; await matches(svc) && Date.now()<end;) await delay(80);
-  return !await matches(svc);
+  if (await matches(svc)) return false;
+  forget(gen);
+  return true;
+}
+function forget(gen) {
+  gen.pid=null; gen.birth=null; delete gen.stopping; atomic(manifest,gen);
+}
+// True once the child is known not to run (it never started, or its exit was seen).
+async function ended(child, tree=false) {
+  if (!child?.pid || child.exitCode!==null || child.signalCode!==null) return true;
+  const gone=new Promise(ok=>child.once("exit",()=>ok(true)));
+  // A hung server may have tool processes below it.
+  if (tree && process.platform==="win32")
+    spawn(join(process.env.SystemRoot,"System32","taskkill.exe"),["/PID",String(child.pid),"/T","/F"],
+      {windowsHide:true,stdio:"ignore",env:{SystemRoot:process.env.SystemRoot}}).on("error",()=>child.kill());
+  else child.kill("SIGKILL");
+  return Promise.race([gone,delay(5000,false)]);
 }
 // An independent supervisor owns the actual child handle and idle clock even
 // after every bridge exits. Admission fences delayed/superseded launch requests.
-async function supervise(token) {
+export async function supervise(token) {
   let child, gen;
   await locked(async()=>{
     gen=optional(manifest);
-    if (gen?.launch!==token) return;
+    if (gen?.launch!==token) { gen=null; return; }
     // If the supervisor itself is hard-killed between spawn and recording
     // the child's creation time, no successor can know jobs.db is free.
     gen.spawning=true; atomic(manifest,gen);
-    child=spawn(exe,["serve","--service","--hostname","127.0.0.1","--port",String(gen.port)],
-      {cwd:root,env:environment(null,root),stdio:"ignore",windowsHide:true});
-    child.on("error",()=>{});
-    gen.pid=child.pid || null; gen.birth=await birth(gen.pid);
+    try {
+      child=spawn(exe,["serve","--service","--hostname","127.0.0.1","--port",String(gen.port)],
+        {cwd:root,env:environment(null,root),stdio:"ignore",windowsHide:true});
+      child.on("error",()=>{});
+      gen.pid=child.pid || null; gen.birth=await birth(gen.pid);
+    } catch (e) {
+      // This process holds the child: when it never ran or was seen to exit, jobs.db is free
+      // and the guard above must not outlive the failure.
+      if (!await ended(child)) throw e;
+      child=null; gen.pid=null; gen.birth=null;
+    }
     gen.launch=null; delete gen.spawning; atomic(manifest,gen);
   });
-  if (!child?.pid || !gen.birth) return;
+  if (!child?.pid || !gen?.birth) return;
   const idleMs=Number(process.env.BRIDGE_SERVICE_IDLE_MS)||600000;
-  let idleSince=Date.now();
+  const hungMs=Number(process.env.BRIDGE_SERVICE_HUNG_MS)||90000;
+  let idleSince=Date.now(), deaf=null, answered=false;
   const stopped=new AbortController();
   child.once("exit",()=>stopped.abort());
+  const mine=()=>{ const cur=optional(manifest); return cur?.pid===gen.pid && cur.birth===gen.birth ? cur : null; };
   while (child.exitCode===null && child.signalCode===null) {
-    try { await delay(Math.min(30000,idleMs),undefined,{signal:stopped.signal}); }
-    catch (e) { if (stopped.signal.aborted) return; throw e; }
+    try { await delay(Math.min(deaf ? 10000 : 30000,idleMs),undefined,{signal:stopped.signal}); }
+    catch (e) { if (stopped.signal.aborted) break; throw e; }
     try { await locked(async()=>{
-      if (!await matches(gen)) return;
+      const cur=mine();
+      if (!cur || !await matches(gen)) return;
       const svc=endpoint(gen);
-      if (!svc || (await readers(svc)).length || Object.keys((await api(svc,"/api/session/active")).data).length) idleSince=null;
+      if (!svc || !await healthy(svc,Math.min(5000,hungMs))) {
+        // Alive but silent reserves jobs.db and fails every job. Only this process can end
+        // exactly that server; a first start gets longer than a server that has answered before.
+        idleSince=null; deaf ??= Date.now();
+        if (Date.now()-deaf>=hungMs*(answered ? 1 : 3)) await ended(child,true);
+        return;
+      }
+      deaf=null; answered=true;
+      if ((await readers(svc)).length || Object.keys((await api(svc,"/api/session/active")).data).length) idleSince=null;
       else {
         idleSince ??= Date.now();
-        if (Date.now()-Math.max(idleSince,statSync(leases).mtimeMs)>=idleMs && await stopIdle(svc)) publish(null);
+        if (Date.now()-Math.max(idleSince,statSync(leases).mtimeMs)>=idleMs && await stopIdle(svc,cur)) publish(null);
       }
     }); } catch { idleSince=null; }
   }
+  await locked(async()=>{
+    const cur=mine();
+    if (cur) { forget(cur); publish(null); }
+  });
 }
-if (process.argv[1] && resolve(process.argv[1])===fileURLToPath(import.meta.url) && process.argv[2]==="supervise")
-  await supervise(process.argv[3]);
 
-export async function acquire() {
-  let attempted=false, waited=0;
-  const deadline=Date.now()+60000;
+// `cancelled()` ends a wait; `waiting(text)` says why a job is held back.
+export async function acquire({cancelled, waiting}={}) {
+  let attempted=false, waited=0, stops=0, queued=false;
+  // Longer than the supervisor takes to end a server that stopped answering.
+  const deadline=Date.now()+150000;
+  const chainMs=Number(process.env.BRIDGE_STANDALONE_CHAIN_MS)||600000;
   const admit=async () => {
     for (const source of [src, join(homedir(), ".config", "opencode")].map(canonical)) {
       const dest = canonical(dst);
@@ -330,26 +391,38 @@ export async function acquire() {
       gen.launch=null; atomic(manifest,gen); attempted=true;
     }
     if (await matches(gen)) {
+      if (gen.stopping) {
+        // It was asked to stop: no new work on it while it goes.
+        if (Date.now()-gen.stopping<15000) return null;
+        delete gen.stopping; atomic(manifest,gen); // the stop did not take
+      }
       svc=endpoint(gen);
       if (!svc || !await healthy(svc,waited ? 6000 : 1500)) {
         waited++;
         if (Date.now()<deadline) return null;
-        throw Error("Worker service is alive but not responding; jobs.db is reserved. Retry when it is ready.");
+        throw Error("Worker service is alive but not responding; jobs.db is reserved. Its supervisor ends a service that stays silent; retry in a few minutes.");
       }
     } else {
       // An active pre-upgrade listener cannot be adopted on PID alone.
       const r=registered();
       if (!gen?.birth && r?.url===`http://127.0.0.1:${gen?.port}` && await legacyWorker(r.pid,gen.port))
-        throw Error("A worker listener without matching creation time still owns the profile port. Close it before retrying.");
-      if (gen?.pid) {gen.pid=null; gen.birth=null; atomic(manifest,gen);}
+        throw Error(`A worker service that this bridge did not start is running unsupervised (process ${r.pid}, port ${gen.port}), most likely left by an older bridge (3.4.0). Close or restart every Claude session that still runs the old bridge, end that process, then retry.`);
+      if (gen?.pid || gen?.stopping) forget(gen);
     }
     const clients=await readers(svc);
     let snap;
     try { if (!gen || !clients.length) snap=snapshot(); }
     catch (e) { if (!gen) throw e; note="Worker config could not be refreshed; using its last installed copy."; }
     if (svc && snap && gen.hash !== snap.hash) {
-      try { if (await stopIdle(svc)) svc=null; else note="Worker config refresh deferred while the service is busy."; }
-      catch { note="Worker service did not confirm an idle stop; config refresh deferred."; if (!await healthy(svc)) return null; }
+      if (stops>=2) note="Worker service did not stop for a config refresh; refresh deferred.";
+      else try {
+        if (await stopIdle(svc,gen)) svc=null;
+        else if (gen.stopping) { stops++; return null; } // asked and not gone yet: never hand it out
+        else note="Worker config refresh deferred while the service is busy.";
+      } catch {
+        if (gen.stopping) { delete gen.stopping; atomic(manifest,gen); }
+        note="Worker service did not confirm an idle stop; config refresh deferred."; if (!await healthy(svc)) return null;
+      }
     }
     if (!svc) {
       if (snap && (!gen || gen.hash !== snap.hash)) {
@@ -357,21 +430,26 @@ export async function acquire() {
         gen = { hash: snap.hash, files: [...snap.files.keys()], pid: null };
         atomic(manifest, gen);
       }
-      if (clients.some(f=>f.endsWith("-private"))) note="A standalone worker holds jobs.db; waiting for it to finish.";
-      else if (!attempted) {
+      // Standalone runs open jobs.db themselves, as every job did before 3.4.0, and may overlap.
+      // A service is never launched beside one, and a standalone run is only granted here, with
+      // no live service. So that overlapping runs cannot keep the service away for good, after a
+      // while newcomers wait for the runs to drain instead of joining them.
+      if (clients.some(f=>f.endsWith("-private"))) {
+        if (Date.now()-(gen.privateSince||0)>=chainMs) {
+          queued=true; waiting?.("Waiting for standalone workers to finish so that the worker service can start.");
+          return null;
+        }
+        note="Worker service is unavailable while standalone workers run; using standalone for this job.";
+      } else if (!attempted) {
         attempted=true;
         const sock=await listener({host:"127.0.0.1",port:0}); gen.port=sock.address().port; await new Promise(ok=>sock.close(ok));
         gen.launch=randomUUID(); gen.requested=Date.now(); atomic(manifest,gen);
         const env={...process.env}; delete env.OPENCODE_PASSWORD; delete env.OPENCODE_SERVER_PASSWORD;
-        try { await independentNode(fileURLToPath(import.meta.url),["supervise",gen.launch],root,env); return null; }
+        try { await independentNode(fileURLToPath(new URL("./supervisor.mjs",import.meta.url)),[gen.launch],root,env); return null; }
         catch { gen.launch=null; atomic(manifest,gen); }
       }
       if (!note) note="Worker service failed to start; using standalone for this job.";
-      // Do not extend a chain of overlapping private leases indefinitely.
-      if (clients.some(f=>f.endsWith("-private"))) {
-        if (++waited<100) return null;
-        throw Error(note);
-      }
+      if (!clients.some(f=>f.endsWith("-private"))) { gen.privateSince=Date.now(); atomic(manifest,gen); }
     }
     if (!gen) throw Error("Cannot establish ownership of the worker service profile.");
     publish(svc);
@@ -384,13 +462,14 @@ export async function acquire() {
       async bindClient(pid) {
         const stamp=await birth(pid); if (!released && !abandoned && stamp) { rec.child={pid,birth:stamp}; atomic(file,rec); }
       },
-      abandon() { abandoned=true; atomic(file,{...rec,pid:null}); },
+      abandon() { if (released || abandoned) return; abandoned=true; atomic(file,{...rec,pid:null}); },
       release() { released=true; if (!abandoned) rmSync(file,{force:true}); }};
   };
   for (;;) {
+    if (cancelled?.()) throw Error("Cancelled while waiting for the worker service.");
     const result=await locked(admit);
-    if (result) return result;
-    await delay(200);
+    if (result) { if (queued) waiting?.(""); return result; }
+    await delay(queued ? 1000 : 200);
   }
 }
 export async function using(fn) {
@@ -416,12 +495,43 @@ export async function warm(svc, cwd) {
     await delay(50);
   }
 }
-// `auth list` excludes providers supplied solely by config. Consult the
-// warmed model catalog before refusing one, including project overrides.
+const keyName = /^(apiKey|api[_-]key|x-api-key|authorization|authToken|accessToken|password)$/i;
+// What a config says about one provider's sign-in: true when it carries a key that resolves or
+// names its own endpoint without one, false when its key points at a variable that is not set,
+// undefined when it says nothing (a mention with only models or options).
+export function configSignIn(entry, env=process.env) {
+  const keys=[];
+  (function visit(obj) {
+    if (!obj || typeof obj!=="object") return;
+    for (const [k,v] of Object.entries(obj)) if (typeof v==="string" && keyName.test(k)) keys.push(v); else visit(v);
+  })(entry);
+  if (keys.length) return keys.every(v => {
+    const ref=/^\{env:([^}]+)\}$/.exec(v);
+    return ref ? ref[1].startsWith("BRIDGE_PROVIDER_") || !!env[ref[1]] : !!v;
+  });
+  return typeof (entry?.options?.baseURL ?? entry?.api)==="string" ? true : undefined;
+}
+// `auth list` excludes providers supplied solely by config, and the model catalog (v2.4.1)
+// lists a provider as soon as a config mentions it, with or without a key. So a provider counts
+// as configured only when it is in the catalog and a config (the worker's, or the project's)
+// carries its sign-in. The answer maps a provider to true (ready) or false (its key is missing).
 export async function availableProviders(svc,cwd) {
-  if (svc) return new Set((await api(svc,`/api/model?directory=${encodeURIComponent(cwd)}`)).data.map(m=>m.providerID));
-  const {stdout}=await promisify(execFile)(exe,["models","--standalone"],{cwd,env:environment(null,cwd),timeout:20000,windowsHide:true,maxBuffer:8e6});
-  return new Set(stdout.split(/\r?\n/).filter(l=>l.includes("/")).map(l=>l.split("/")[0]));
+  let listed;
+  if (svc) listed=new Set((await api(svc,`/api/model?directory=${encodeURIComponent(cwd)}`)).data.map(m=>m.providerID));
+  else {
+    const {stdout}=await promisify(execFile)(exe,["models","--standalone"],{cwd,env:environment(null,cwd),timeout:20000,windowsHide:true,maxBuffer:8e6});
+    listed=new Set(stdout.split(/\r?\n/).filter(l=>l.includes("/")).map(l=>l.split("/")[0]));
+  }
+  const found=new Map();
+  for (const dir of [dst,cwd,join(cwd,".opencode")]) for (const name of ["opencode.json","opencode.jsonc"]) {
+    let cfg;
+    try { cfg=parseConfig(readFileSync(join(dir,name),"utf8")); } catch { continue; }
+    for (const [id,entry] of Object.entries({...cfg?.providers,...cfg?.provider})) {
+      const state=configSignIn(entry);
+      if (state!==undefined && listed.has(id)) found.set(id,state);
+    }
+  }
+  return found;
 }
 export function signInStatus(rows, provider, available) {
   const row = rows.find(r => r.id === provider);
@@ -429,7 +539,8 @@ export function signInStatus(rows, provider, available) {
   const selected = row?.connections?.find(c => c.type === "credential");
   if (selected?.status?.status === "needs_auth") return "Sign in again";
   if (selected) return "Signed in";
-  if (available?.has(provider)) return "No sign-in required";
+  if (available?.get(provider)===true) return "No sign-in required";
+  if (available?.get(provider)===false) return "Missing";
   if (row?.methods?.length || row?.connections?.length || ["openai", "deepseek", "anthropic"].includes(provider)) return "Missing";
   return "No sign-in required";
 }

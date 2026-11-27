@@ -1314,7 +1314,7 @@ async function missingSignIn(svc, model, cwd) {
   const status = profile.signInStatus(rows, provider, available);
   // The standalone auth list contains only connected integrations. A remote worker
   // still needs an actionable error when its provider is absent from that list.
-  if (status !== "Missing" && status !== "Sign in again" && (svc || available.has(provider) || rows.some(r => r.id === provider))) return "";
+  if (status !== "Missing" && status !== "Sign in again" && (svc || available.get(provider) === true || rows.some(r => r.id === provider))) return "";
   const helper = fileURLToPath(new URL("./bridge-auth.mjs", import.meta.url));
   return `Worker provider "${provider}" ${status === "Sign in again" ? "needs a fresh sign-in" : "has no sign-in"}. Sign in for workers in OpenCode Config Studio › Workers, or run: node "${helper}" login ${provider}`;
 }
@@ -1450,7 +1450,11 @@ async function runAgent(job, args) {
       checkSession=!earlier;
     }
     if (!isClaudeJob(args) && !workerSet().magic) {
-      lease = await profile.acquire();
+      // Waiting for the worker service must not outlive a cancel, and opencode_list says what is waited for.
+      lease = await profile.acquire({
+        cancelled: () => job.cancelled || cancelAsked(job.state.id),
+        waiting: (text) => { job.state.profileNote = text; saveState(job.state); },
+      });
       job.state.profileNote=lease.note;
       const cwd = args.directory && existsSync(args.directory) ? resolve(args.directory) : process.cwd();
       let ref = args.model;
@@ -1480,6 +1484,7 @@ async function runAgent(job, args) {
     if (job.cancelled || cancelAsked(job.state.id)) return finish(job, "cancelled", "cancelled before it started");
     return await runClient(job, args, lease);
   } catch (e) {
+    if (job.cancelled || cancelAsked(job.state.id)) return finish(job, "cancelled", "cancelled before it started");
     return finish(job, "failed", `Could not prepare OpenCode worker: ${e.message.split("\n")[0]}`);
   } finally { lease?.release(); }
 }
@@ -1609,6 +1614,7 @@ function runClient(job, { prompt, directory, files = [], allow_edits = false, ag
       return stopSession(s.session, lease?.svc || s.serviceMode).then((r) => done(resumeNote({ session: s.session, ...r })));
     };
     job.cancel = (fast = false) => end("cancelled", fast ? "its Claude session closed" : "stopped by opencode_cancel", fast);
+    job.abandon = () => lease?.svc && lease.abandon();
 
     const wallTimer = setTimeout(() => {
       const flight = flightNow();
@@ -1683,7 +1689,7 @@ function runClient(job, { prompt, directory, files = [], allow_edits = false, ag
       mark();
       try {
         if (lease?.svc) {
-          const replacement = await profile.acquire();
+          const replacement = await profile.acquire({ cancelled: () => ended });
           if (!replacement.svc) { replacement.release(); throw Error("No worker session service to verify the earlier run."); }
           lease.release();
           Object.assign(lease, replacement);
@@ -2229,9 +2235,18 @@ ${TASK_WAIT}` : progressOne(s));
 
 // Stop this instance's running jobs when the session closes, so no build is left behind.
 let closing=false;
+const SHUTDOWN_MS = Math.max(500, Number(process.env.OPENCODE_SHUTDOWN_MS ?? 5000));
 async function shutdown() {
   if (closing) return;
   closing=true;
+  // The client that closed is not waiting: a probe or an interrupt that hangs must not keep this
+  // process. A session not interrupted in time is left on its lease for the next coordinator.
+  setTimeout(() => {
+    for (const j of jobs.values()) {
+      try { j.abandon?.(); } catch { /* leaving anyway */ }
+    }
+    process.exit(0);
+  }, SHUTDOWN_MS);
   await Promise.allSettled([...jobs.values()].map(j=>{
     j.cancelled=true;
     return j.state.status==="running" && j.cancel?.(true);
