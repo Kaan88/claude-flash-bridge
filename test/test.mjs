@@ -609,7 +609,7 @@ await test("with OPENCODE_TASKS a job is an MCP task: the run returns at once an
   assert.match(gone.result.content[0].text, /^status: cancelled/);
 
   // the older protocol still works on the same server
-  assert.equal((await t.start()).serverInfo.version, "3.4.0");
+  assert.equal((await t.start()).serverInfo.version, "3.5.0");
   t.stop();
 });
 
