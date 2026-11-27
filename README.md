@@ -20,7 +20,7 @@ agents, the worker list, and it installs and updates this bridge.
 
 | Tool | What it does |
 |---|---|
-| `opencode_run` | Starts a job on a worker and returns **at once** with a job id (`job_k3x_2`). Inputs: `prompt`, `worker` (one of the listed names; the default worker when left out), `directory`, `allow_edits`, `session`, `effort` (one of that worker's model's levels), `files`, `timeout_seconds`, `idle_seconds`, `tool_idle_seconds`. |
+| `opencode_run` | Starts a job on a worker and returns **at once** with a job id (`job_k3x_2`). Inputs: `prompt`, `label` (optional: a short name shown in the task list; it becomes the tail of the job id, `job_k3x_2-card-fixes`, and the job still answers to `job_k3x_2`), `worker` (one of the listed names; the default worker when left out), `directory`, `allow_edits`, `session`, `effort` (one of that worker's model's levels), `files`, `timeout_seconds`, `idle_seconds`, `tool_idle_seconds`. |
 | `opencode_result` | `{ job }` or `{ jobs: [...] }`, plus `wait_seconds?`. **One call waits** for the job, or for **any** of the jobs (50 seconds by default, see "Waiting"), then returns each finished reply (ending in `session: ses_…`) and one progress line per job still running (elapsed time, last output, last tool, the tool call in flight, files edited, why it is queued). With `jobs`, each reply is returned once; call again only while it says jobs are still running. |
 | `opencode_cancel` | `{ job }`. Stops a queued or running job of **any** session: kills its process tree and interrupts its OpenCode session, so builds and tests it started stop too. The reply's `resume:` line says whether the session is idle or still busy. On a job that already timed out or failed it interrupts a session that is still busy. Edits stay on disk; the session can be continued. |
 | `opencode_list` | No input. The workers, how long a wait may be, and every queued and running job on the machine, from all sessions: id, state, model, owner process (alive or gone), start time, running time, last tool, last output, the tool call in flight, queue place; then who holds the places of each pool, and the sessions an ended job left busy in OpenCode. |
@@ -88,9 +88,15 @@ explicit interrupt and records the session on its lease for crash recovery. Brid
 time and OS listener owner **before** authenticating and coordinate starts and config updates under a cross-process lock. An update waits for an idle
 service: even a client preparing to start or signing in holds a place. If the service can't start, jobs fall back
 to `run --standalone` with the **worker** config, credentials and DB. Live session inspection is unavailable in
-that fallback. A live but unresponsive service reserves the database; jobs wait or report the blocker instead of
-opening it standalone. Closing a Claude session does not stop the shared service. An independent supervisor
-retires it after ten minutes without leases or active sessions.
+that fallback. Standalone jobs run side by side, and no service is started while one of them runs. When such
+jobs have overlapped for ten minutes, a new job waits (it can be cancelled) until they are done, so the service
+gets a chance to start again. A live but unresponsive service reserves the database; jobs wait for it instead
+of opening it standalone. Closing a Claude session does not stop the shared service.
+
+An independent supervisor (`supervisor.mjs`, started by the first bridge that needs the service) owns the
+service process. It retires the service after ten minutes without leases or active sessions, and ends one that
+stops answering (after 90 seconds; a first start gets 270), so the next job starts a fresh one. On Windows it
+receives the bridge's environment directly from the bridge, not through PowerShell.
 
 **Cost:** on the owner's Windows machine 3.3.0 used ~350–370 MB working set per private server **plus** ~125 MB per
 client (~2.4 GB for five jobs). Normal 3.4.0 usage is **one worker server plus ~125 MB per concurrent job**.
@@ -144,9 +150,17 @@ for live worker sessions; the personal service has its own list.
 Show the two services by name and version. Don't use personal `service restart` for workers, edit the generated
 copy, or run automatic service discovery with the worker environment: the bridge owns worker startup and rotation.
 
-When upgrading from 3.4.0, drain existing jobs and close old bridge clients first. A still-running
-3.4.0 worker has no recorded creation time. If the bridge reports that old listener, stop the **worker**
-with its contract environment after it drains; the next request starts a supervised instance.
+**Upgrading from 3.4.0:** let current jobs finish, then close or restart every Claude session that still runs
+the old bridge before using the new one. A 3.4.0 bridge does not know the supervisor: it would stop, replace or
+bypass the supervised service. So 3.5.0 refuses to work beside it and says why:
+
+- "An older bridge (3.4.0, process N) is still using the worker profile": a job of an old bridge is running.
+  Close or restart the Claude session that runs it, then retry.
+- "A worker service that this bridge did not start is running unsupervised (process N, port P)": an old bridge
+  started the worker service. Close the old bridges, end process N (it is the **worker** service, not your
+  personal one), then retry; the next request starts a supervised instance.
+
+An old bridge that is open but idle cannot be seen until it starts a job.
 
 **Upgrading a running 3.3 installation:** let current jobs finish and hold new submissions. Before changing the
 live bridge, quit any older Config Studio instance and launch the new Studio build with `STUDIO_WORKER_AUTH_HELPER`
@@ -299,7 +313,7 @@ Each session runs its own copy of the server. After changing `server.mjs`: in a 
 
 ## Tests
 
-`node test/test.mjs` (no dependencies, about a minute). It checks the rules on their own (queue places, idle
+`node test/test.mjs` (no dependencies, about four minutes; it also runs `test/coordination.mjs`). It checks the rules on their own (queue places, idle
 limits, the stats line) and then drives the server over MCP stdio against `test/fake-opencode.mjs`, a stand-in
 for the `opencode` executable, so no model is called.
 
